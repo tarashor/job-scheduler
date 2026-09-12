@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed Job Scheduler Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-main: #0d1117;
+            --bg-card: #161b22;
+            --bg-input: #21262d;
+            --border: #30363d;
+            --text-primary: #f0f6fc;
+            --text-secondary: #8b949e;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-amber: #d29922;
+            --accent-red: #f85149;
+            --accent-purple: #bc8cff;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
+        body { background: var(--bg-main); color: var(--text-primary); padding: 24px; }
+        .container { max-width: 1300px; margin: 0 auto; }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+        h1 { font-size: 24px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+        .badge-leader { background: rgba(63, 185, 80, 0.15); color: var(--accent-green); border: 1px solid var(--accent-green); padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 18px; }
+        .card h3 { font-size: 14px; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.5px; }
+        .card .stat { font-size: 28px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+        
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin: 24px 0 12px; }
+        .section-header h2 { font-size: 18px; font-weight: 600; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 14px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border); }
+        th { color: var(--text-secondary); font-weight: 600; background: rgba(255,255,255,0.02); }
+        
+        .status-badge { display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; font-family: 'JetBrains Mono', monospace; }
+        .status-COMPLETED, .status-HEALTHY { background: rgba(63, 185, 80, 0.15); color: var(--accent-green); }
+        .status-RUNNING { background: rgba(88, 166, 255, 0.15); color: var(--accent-blue); }
+        .status-QUEUED, .status-READY { background: rgba(210, 153, 34, 0.15); color: var(--accent-amber); }
+        .status-FAILED, .status-DEAD { background: rgba(248, 81, 73, 0.15); color: var(--accent-red); }
+        .status-DEAD_LETTER { background: rgba(188, 140, 255, 0.15); color: var(--accent-purple); }
+        .status-WAITING_DEPENDENCIES { background: rgba(139, 148, 158, 0.15); color: var(--text-secondary); }
+
+        button { background: var(--accent-blue); color: #fff; border: none; padding: 7px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; transition: opacity 0.2s; }
+        button:hover { opacity: 0.85; }
+        button.btn-danger { background: var(--accent-red); }
+        button.btn-amber { background: var(--accent-amber); color: #000; }
+        button.btn-sm { padding: 4px 8px; font-size: 12px; }
+
+        .dag-node-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+        .dag-node { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-size: 12px; }
+        .dag-node .name { font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+        .dag-node .deps { color: var(--text-secondary); font-size: 11px; }
+
+        pre { font-family: 'JetBrains Mono', monospace; font-size: 12px; background: var(--bg-input); padding: 8px; border-radius: 4px; overflow-x: auto; color: #79c0ff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>⚙️ Distributed Job Scheduler</h1>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-top: 4px;">Coordinator-Worker Cluster Architecture with Leased Leader Election & DAG Engine</p>
+            </div>
+            <div style="display: flex; gap: 10px; align-items: center;">
+                <span id="leaderStatus" class="badge-leader">Leader: active-master</span>
+                <span id="fencingToken" class="badge-leader" style="border-color: var(--accent-purple); color: var(--accent-purple); background: rgba(188, 140, 255, 0.15)">Token: 1</span>
+                <button onclick="stepDownLeader()" class="btn-amber">Simulate Leader Failover</button>
+            </div>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <h3>Registered Jobs</h3>
+                <div class="stat" id="statJobs">-</div>
+            </div>
+            <div class="card">
+                <h3>Active Workers</h3>
+                <div class="stat" style="color: var(--accent-green);" id="statWorkers">-</div>
+            </div>
+            <div class="card">
+                <h3>Queued Tasks</h3>
+                <div class="stat" style="color: var(--accent-amber);" id="statQueue">-</div>
+            </div>
+            <div class="card">
+                <h3>Dead Letter Queue (DLQ)</h3>
+                <div class="stat" style="color: var(--accent-red);" id="statDlq">-</div>
+            </div>
+        </div>
+
+        <div class="section-header">
+            <h2>Cluster Workers</h2>
+            <button onclick="refreshData()" class="btn-sm">Refresh</button>
+        </div>
+        <div class="card" style="padding: 0; overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Worker ID</th>
+                        <th>Status</th>
+                        <th>Capacity</th>
+                        <th>Current Load</th>
+                        <th>Active Tasks</th>
+                        <th>Last Heartbeat</th>
+                    </tr>
+                </thead>
+                <tbody id="workersBody"><tr><td colspan="6" style="text-align:center;">Loading workers...</td></tr></tbody>
+            </table>
+        </div>
+
+        <div class="section-header">
+            <h2>Job Definitions</h2>
+            <button onclick="triggerSampleDag()" class="btn-sm">+ Trigger Sample ETL DAG</button>
+        </div>
+        <div class="card" style="padding: 0; overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Job ID</th>
+                        <th>Name</th>
+                        <th>Schedule</th>
+                        <th>Tasks (DAG)</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="jobsBody"><tr><td colspan="5" style="text-align:center;">Loading jobs...</td></tr></tbody>
+            </table>
+        </div>
+
+        <div class="section-header">
+            <h2>Recent Job Runs & DAG Progress</h2>
+        </div>
+        <div class="card" style="padding: 0; overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Run ID</th>
+                        <th>Job ID</th>
+                        <th>Status</th>
+                        <th>Trigger Source</th>
+                        <th>Triggered At</th>
+                        <th>DAG Task Instances</th>
+                    </tr>
+                </thead>
+                <tbody id="runsBody"><tr><td colspan="6" style="text-align:center;">Loading runs...</td></tr></tbody>
+            </table>
+        </div>
+
+        <div class="section-header">
+            <h2>Dead Letter Queue (DLQ)</h2>
+        </div>
+        <div class="card" style="padding: 0; overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>DLQ ID</th>
+                        <th>Task ID</th>
+                        <th>Attempts</th>
+                        <th>Failure Reason</th>
+                        <th>Failed At</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="dlqBody"><tr><td colspan="6" style="text-align:center;">DLQ is empty</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        async function fetchJson(url, options = {}) {
+            try {
+                const res = await fetch(url, options);
+                return await res.json();
+            } catch (err) {
+                console.error("Fetch failed", url, err);
+                return null;
+            }
+        }
+
+        async function refreshData() {
+            const health = await fetchJson('/api/health');
+            if (health) {
+                document.getElementById('leaderStatus').textContent = (health.isLeader ? 'Leader: ' : 'Standby: ') + health.coordinatorId;
+                document.getElementById('fencingToken').textContent = 'FencingToken: ' + health.fencingToken;
+                document.getElementById('statQueue').textContent = health.queueSize;
+                document.getElementById('statDlq').textContent = health.dlqSize;
+            }
+
+            const jobs = await fetchJson('/api/jobs');
+            if (jobs) {
+                document.getElementById('statJobs').textContent = jobs.length;
+                renderJobs(jobs);
+            }
+
+            const workers = await fetchJson('/api/workers');
+            if (workers) {
+                const healthyCount = workers.filter(w => w.status === 'HEALTHY').length;
+                document.getElementById('statWorkers').textContent = healthyCount + ' / ' + workers.length;
+                renderWorkers(workers);
+            }
+
+            const runs = await fetchJson('/api/runs');
+            if (runs) {
+                renderRuns(runs);
+            }
+
+            const dlq = await fetchJson('/api/dlq');
+            if (dlq) {
+                renderDlq(dlq);
+            }
+        }
+
+        function renderWorkers(workers) {
+            const tbody = document.getElementById('workersBody');
+            if (workers.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--text-secondary);">No registered workers</td></tr>';
+                return;
+            }
+            tbody.innerHTML = workers.map(w => {
+                const elapsed = Math.round((Date.now() - w.lastHeartbeatEpochMs) / 1000);
+                return `
+                    <tr>
+                        <td><strong>${w.workerId}</strong></td>
+                        <td><span class="status-badge status-${w.status}">${w.status}</span></td>
+                        <td>${w.capacity}</td>
+                        <td>${w.currentLoad}</td>
+                        <td>${Array.from(w.activeTaskIds || []).join(', ') || '-'}</td>
+                        <td>${elapsed}s ago</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderJobs(jobs) {
+            const tbody = document.getElementById('jobsBody');
+            if (jobs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--text-secondary);">No jobs configured</td></tr>';
+                return;
+            }
+            tbody.innerHTML = jobs.map(j => {
+                const sched = typeof j.schedule === 'object' ? JSON.stringify(j.schedule) : j.schedule;
+                const dagList = j.tasks.map(t => `<span class="dag-node"><span class="name">${t.taskId}</span> ${t.dependencies.length > 0 ? '<span class="deps">← [' + t.dependencies.join(',') + ']</span>' : ''}</span>`).join(' ');
+                return `
+                    <tr>
+                        <td><code>${j.jobId}</code></td>
+                        <td><strong>${j.name}</strong></td>
+                        <td><code>${sched}</code></td>
+                        <td><div class="dag-node-list">${dagList}</div></td>
+                        <td><button onclick="triggerJob('${j.jobId}')" class="btn-sm">Trigger Run</button></td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderRuns(runs) {
+            const tbody = document.getElementById('runsBody');
+            if (runs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--text-secondary);">No runs recorded yet</td></tr>';
+                return;
+            }
+            tbody.innerHTML = runs.map(r => {
+                const date = new Date(r.triggeredAtEpochMs).toLocaleTimeString();
+                const taskBadges = (r.taskInstances || []).map(t => 
+                    `<span class="dag-node">
+                        <span class="name">${t.taskId}</span>: 
+                        <span class="status-badge status-${t.status}">${t.status}</span>
+                        ${t.output ? '<br/><small>' + t.output + '</small>' : ''}
+                        ${t.error ? '<br/><small style="color:var(--accent-red);">' + t.error + '</small>' : ''}
+                    </span>`
+                ).join(' ');
+
+                return `
+                    <tr>
+                        <td><code>${r.runId.substring(0, 8)}...</code></td>
+                        <td><strong>${r.jobId}</strong></td>
+                        <td><span class="status-badge status-${r.status}">${r.status}</span></td>
+                        <td>${r.triggerSource}</td>
+                        <td>${date}</td>
+                        <td><div class="dag-node-list">${taskBadges || 'No tasks created'}</div></td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderDlq(entries) {
+            const tbody = document.getElementById('dlqBody');
+            if (entries.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--text-secondary);">DLQ is empty - all healthy!</td></tr>';
+                return;
+            }
+            tbody.innerHTML = entries.map(e => `
+                <tr>
+                    <td><code>${e.id.substring(0, 8)}...</code></td>
+                    <td><strong>${e.taskInstance.taskId}</strong></td>
+                    <td>${e.taskInstance.attempt}</td>
+                    <td style="color: var(--accent-red);">${e.reason}</td>
+                    <td>${new Date(e.failedAtEpochMs).toLocaleTimeString()}</td>
+                    <td><button onclick="retryDlq('${e.id}')" class="btn-sm btn-amber">Retry</button></td>
+                </tr>
+            `).join('');
+        }
+
+        async function triggerJob(jobId) {
+            await fetch('/api/jobs/' + jobId + '/trigger', { method: 'POST' });
+            setTimeout(refreshData, 300);
+        }
+
+        async function retryDlq(dlqId) {
+            await fetch('/api/dlq/' + dlqId + '/retry', { method: 'POST' });
+            setTimeout(refreshData, 300);
+        }
+
+        async function stepDownLeader() {
+            await fetch('/api/cluster/stepdown', { method: 'POST' });
+            setTimeout(refreshData, 500);
+        }
+
+        async function triggerSampleDag() {
+            await fetch('/api/samples/dag', { method: 'POST' });
+            setTimeout(refreshData, 300);
+        }
+
+        refreshData();
+        setInterval(refreshData, 2000);
+    </script>
+</body>
+</html>

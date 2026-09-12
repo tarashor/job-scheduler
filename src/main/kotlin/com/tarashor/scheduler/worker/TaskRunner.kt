@@ -1,0 +1,113 @@
+package com.tarashor.scheduler.worker
+
+import com.tarashor.scheduler.core.model.TaskAction
+import com.tarashor.scheduler.core.model.TaskExecutionResult
+import com.tarashor.scheduler.core.model.TaskInstance
+import io.ktor.client.*
+import io.ktor.client.engine.cio.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.http.*
+import kotlinx.coroutines.*
+import org.slf4j.LoggerFactory
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+interface TaskRunner {
+    suspend fun execute(instance: TaskInstance, timeoutMs: Long): TaskExecutionResult
+}
+
+class DefaultTaskRunner : TaskRunner {
+    private val logger = LoggerFactory.getLogger(DefaultTaskRunner::class.java)
+    private val httpClient = HttpClient(CIO)
+
+    override suspend fun execute(instance: TaskInstance, timeoutMs: Long): TaskExecutionResult {
+        return try {
+            withTimeout(timeoutMs) {
+                when (val action = instance.action) {
+                    is TaskAction.Shell -> executeShell(instance, action)
+                    is TaskAction.Http -> executeHttp(instance, action)
+                    is TaskAction.Simulate -> executeSimulate(instance, action)
+                }
+            }
+        } catch (e: TimeoutCancellationException) {
+            logger.warn("Task '${instance.taskInstanceId}' timed out after ${timeoutMs}ms")
+            TaskExecutionResult(
+                taskInstanceId = instance.taskInstanceId,
+                success = false,
+                error = "Task timed out after ${timeoutMs}ms"
+            )
+        } catch (e: Exception) {
+            logger.error("Error executing task '${instance.taskInstanceId}'", e)
+            TaskExecutionResult(
+                taskInstanceId = instance.taskInstanceId,
+                success = false,
+                error = e.message ?: e.javaClass.simpleName
+            )
+        }
+    }
+
+    private suspend fun executeShell(instance: TaskInstance, action: TaskAction.Shell): TaskExecutionResult =
+        withContext(Dispatchers.IO) {
+            logger.info("Executing shell command for '${instance.taskInstanceId}': ${action.command}")
+            val process = ProcessBuilder("/bin/sh", "-c", action.command)
+                .redirectErrorStream(true)
+                .start()
+
+            val output = process.inputStream.bufferedReader().readText()
+            val finished = process.waitFor(60, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                return@withContext TaskExecutionResult(
+                    taskInstanceId = instance.taskInstanceId,
+                    success = false,
+                    error = "Process forcibly terminated after 60s"
+                )
+            }
+
+            val exitCode = process.exitValue()
+            TaskExecutionResult(
+                taskInstanceId = instance.taskInstanceId,
+                success = exitCode == 0,
+                output = output.trim(),
+                error = if (exitCode != 0) "Process exited with code $exitCode" else null
+            )
+        }
+
+    private suspend fun executeHttp(instance: TaskInstance, action: TaskAction.Http): TaskExecutionResult {
+        logger.info("Executing HTTP ${action.method} request for '${instance.taskInstanceId}' to ${action.url}")
+        val response = httpClient.request(action.url) {
+            method = HttpMethod.parse(action.method)
+            action.headers.forEach { (k, v) -> header(k, v) }
+            if (action.body != null) {
+                setBody(action.body)
+            }
+        }
+        val isSuccess = response.status.value in 200..299
+        val body = response.bodyAsText()
+        return TaskExecutionResult(
+            taskInstanceId = instance.taskInstanceId,
+            success = isSuccess,
+            output = "HTTP ${response.status}: $body",
+            error = if (!isSuccess) "HTTP status ${response.status}" else null
+        )
+    }
+
+    private suspend fun executeSimulate(instance: TaskInstance, action: TaskAction.Simulate): TaskExecutionResult {
+        logger.info("Simulating task '${instance.taskInstanceId}' for ${action.durationMs}ms")
+        delay(action.durationMs)
+        return if (action.shouldFail) {
+            TaskExecutionResult(
+                taskInstanceId = instance.taskInstanceId,
+                success = false,
+                error = "Simulated failure: ${action.message}"
+            )
+        } else {
+            TaskExecutionResult(
+                taskInstanceId = instance.taskInstanceId,
+                success = true,
+                output = "Simulated success: ${action.message}"
+            )
+        }
+    }
+}
