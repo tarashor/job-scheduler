@@ -1,266 +1,399 @@
-# Distributed Job Scheduler & Workflow Orchestrator
+# Розподілений планувальник завдань та оркестратор робочих процесів (Мікросервісна архітектура)
 
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.4.0-blue.svg)](https://kotlinlang.org)
 [![JDK](https://img.shields.io/badge/JDK-25%2B-orange.svg)](https://openjdk.org)
 [![Ktor](https://img.shields.io/badge/Ktor-3.1.1-purple.svg)](https://ktor.io)
+[![Docker Compose](https://img.shields.io/badge/Docker%20Compose-Ready-blue.svg)]()
 [![Tests](https://img.shields.io/badge/Tests-Passing-brightgreen.svg)]()
 
-A production-grade, distributed job scheduler and DAG workflow orchestrator designed specifically around the **canonical System Design Interview question** (*"Design a Distributed Job Scheduler / Distributed Cron / Workflow Orchestrator like Airflow, Temporal, or Quartz"*) asked at Google, Meta, Uber, Amazon, and Netflix.
+Розподілений планувальник завдань та оркестратор DAG-робочих процесів, декомпонований на **незалежні контейнеризовані мікросервіси** та спроєктований за канонічним питанням із **System Design співбесід** (*«Design a Distributed Job Scheduler / Workflow Orchestrator like Temporal, Airflow, or Quartz»*), які проводять у Google, Meta, Uber, Amazon та Netflix.
 
 ---
 
-## Table of Contents
-1. [System Design Interview Blueprint](#1-system-design-interview-blueprint)
-   - [Requirements](#requirements)
-   - [Capacity Estimation & Scale](#capacity-estimation--scale)
-2. [Cluster Architecture & Data Flow](#2-cluster-architecture--data-flow)
-3. [Deep-Dive Interview Topics](#3-deep-dive-interview-topics)
-   - [At-Least-Once vs. Exactly-Once & Idempotency](#at-least-once-vs-exactly-once--idempotency)
-   - [Split-Brain Protection & Fencing Tokens](#split-brain-protection--fencing-tokens)
-   - [High-Precision Delayed Scheduling (Two-Tier Bucketing)](#high-precision-delayed-scheduling-two-tier-bucketing)
-   - [Push vs. Pull Task Dispatch & Backpressure](#push-vs-pull-task-dispatch--backpressure)
-   - [DAG Orchestration via Topological In-Degree](#dag-orchestration-via-topological-in-degree)
-   - [Worker Health, Heartbeats & Task Reclamation](#worker-health-heartbeats--task-reclamation)
-   - [Exponential Backoff with Jitter & Dead Letter Queue (DLQ)](#exponential-backoff-with-jitter--dead-letter-queue-dlq)
-4. [Codebase Architecture & File Mapping](#4-codebase-architecture--file-mapping)
-5. [Quickstart & Running Locally](#5-quickstart--running-locally)
-   - [Running the Cluster](#running-the-cluster)
-   - [Interactive Web Dashboard](#interactive-web-dashboard)
-   - [REST API Reference & cURL Examples](#rest-api-reference--curl-examples)
-6. [Running the Test Suite](#6-running-the-test-suite)
+## Зміст
+1. [Мікросервісна декомпозиція](#1-мікросервісна-декомпозиція)
+   - [Архітектурна топологія](#архітектурна-топологія)
+   - [Діаграма послідовності (Sequence Diagram)](#діаграма-послідовності-sequence-diagram)
+   - [Ролі та обов'язки мікросервісів](#ролі-та-обов-язки-мікросервісів)
+2. [Системний дизайн: Шаблон для співбесід](#2-системний-дизайн-шаблон-для-співбесід)
+   - [Функціональні та нефункціональні вимоги](#функціональні-та-нефункціональні-вимоги)
+   - [Оцінка пропускної здатності та масштаб](#оцінка-пропускної-здатності-та-масштаб)
+3. [Поглиблені теми для системного дизайну](#3-поглиблені-теми-для-системного-дизайну)
+   - [Доставка «щонайменше один раз» (At-Least-Once) та міжсервісна ідемпотентність](#доставка-щонайменше-один-раз-at-least-once-та-міжсервісна-ідемпотентність)
+   - [Захист від Split-Brain через монотонні токени розмежування (Fencing Tokens)](#захист-від-split-brain-через-монотонні-токени-розмежування-fencing-tokens)
+   - [Високоточне відкладене планування (Дворівнева бакетизація часу)](#високоточне-відкладене-планування-дворівнева-бакетизація-часу)
+   - [Модель диспетчеризації: Push проти Pull та Backpressure](#модель-диспетчеризації-push-проти-pull-та-backpressure)
+   - [Оркестрація DAG через алгоритм Кана (Kahn's Algorithm)](#оркестрація-dag-через-алгоритм-кана-kahns-algorithm)
+   - [Моніторинг воркерів, Heartbeats та рекламація завдань](#моніторинг-воркерів-heartbeats-та-рекламація-завдань)
+   - [Експоненційне відтермінування з джитером (Exponential Backoff with Jitter) та черга DLQ](#експоненційне-відтермінування-з-джитером-exponential-backoff-with-jitter-та-черга-dlq)
+   - [Детальне архітектурне обґрунтування: Чому обрано Redis замість Kafka](#детальне-архітектурне-обґрунтування-чому-обрано-redis-замість-kafka)
+4. [Багатомодульна структура кодової бази](#4-багатомодульна-структура-кодової-бази)
+5. [Запуск мікросервісів](#5-запуск-мікросервісів)
+   - [Варіант A: Docker Compose (Повний розподілений кластер)](#варіант-a-docker-compose-повний-розподілений-кластер)
+   - [Варіант B: Локальні Gradle-сервіси (Режим розробки)](#варіант-b-локальні-gradle-сервіси-режим-розробки)
+   - [Інтерактивна веб-панель керування (Dashboard)](#інтерактивна-веб-панель-керування-dashboard)
+   - [Приклади REST API для клієнтських мікросервісів](#приклади-rest-api-для-клієнтських-мікросервісів)
+6. [Верифікація тестового набору](#6-верифікація-тестового-набору)
 
 ---
 
-## 1. System Design Interview Blueprint
+## 1. Мікросервісна декомпозиція
 
-### Requirements
+Замість монолітної структури система розділена на спеціалізовані, незалежно розгортані мікросервісні субпроєкти:
 
-#### Functional Requirements
-1. **Flexible Scheduling**:
-   - **One-off delayed jobs**: Execute at a specific future timestamp ($T$).
-   - **Recurring Cron schedules**: Standard 5-field cron syntax (`minute hour dayOfMonth month dayOfWeek`) and presets (`@daily`, `@hourly`, etc.).
-   - **Immediate / Manual triggers**: Trigger job executions immediately via API or Web UI.
-2. **DAG Workflow Dependencies**:
-   - Tasks within a job can declare dependencies on other tasks (Directed Acyclic Graph).
-   - Upstream tasks must complete successfully before downstream tasks are dispatched.
-   - Cycle detection and validation using Kahn's algorithm.
-3. **Worker Pool & Execution**:
-   - Decoupled worker nodes pull tasks and run sandboxed actions (Shell commands, HTTP calls, JVM execution).
-   - Execution timeout enforcement.
-4. **Fault Tolerance & Resilience**:
-   - **Worker crash detection**: Heartbeat monitoring; if a worker stops emitting heartbeats, tasks are reclaimed and rescheduled.
-   - **Automatic retries**: Exponential backoff with jitter.
-   - **Dead Letter Queue (DLQ)**: Tasks exceeding `maxRetries` are safely routed to DLQ with full diagnostic history and manual replay.
-5. **Observability & Management**:
-   - HTTP REST API for cluster health, job submission, and execution metrics.
-   - Embedded real-time Web Dashboard visualizing workers, DAG progress, and failovers.
-
-#### Non-Functional Requirements
-- **High Availability**: No single point of failure (SPOF). Active-Standby Coordinator failover.
-- **Precision**: Accurate trigger dispatch within $\pm 1$ second.
-- **Idempotency**: Prevent duplicate executions using fencing tokens and idempotency keys.
-- **Scalability**: Decoupled pull-based workers scale horizontally without coordinator saturation.
-
-### Capacity Estimation & Scale
-- **Daily job volume**: 100 million scheduled runs/day $\approx 1{,}160$ jobs/sec average (peak $5{,}000$ jobs/sec).
-- **Metadata storage**: $1\text{ KB}$ per job definition $\times 10\text{M jobs} = 10\text{ GB}$.
-- **Execution log storage**: $2\text{ KB}$ per execution $\times 100\text{M runs/day} = 200\text{ GB/day}$. Retained with TTL / cold archiving.
-
----
-
-## 2. Cluster Architecture & Data Flow
+### Архітектурна топологія
 
 ```mermaid
 flowchart TD
-    Client["Clients / Web Dashboard / CLI"] --> API["REST API Gateway (:8080)"]
+    ClientSvc["Клієнтські мікросервіси<br/>(Order, Billing, Analytics)"] -->|"REST / HTTP"| API["1. scheduler-api Мікросервіс<br/>(Порт :8080)"]
     
-    subgraph Storage ["Distributed Persistent Layer"]
-        DB[("Metadata & History Store<br/>(SQLite / PostgreSQL)")]
-        CoordStore[("Lease Store<br/>(Compare-And-Swap)")]
+    subgraph StorageLayer ["Інфраструктура черг та координації"]
+        Redis[("Redis 7<br/>• Розподілена ZSET черга затримок<br/>• Лізингові блокування (SET NX PX)<br/>• Хеші метаданих та запусків")]
     end
-    
-    API --> DB
-    
-    subgraph CoordinatorGroup ["Scheduler Master (Active-Standby)"]
-        ActiveMaster["Active Master (Leader)<br/>1. Schedule Clock & Cron Ticker<br/>2. DAG Engine (In-degree Tracker)<br/>3. Worker Health & Failure Reaper"]
-        StandbyMaster["Standby Master(s)"]
-        ActiveMaster -.->|"Lease Renewal (every 2s)"| CoordStore
-        StandbyMaster -.->|"Watch Expiration"| CoordStore
+
+    API -->|"Збереження Job / Миттєвий запуск"| Redis
+
+    subgraph CoordinatorPods ["2. scheduler-coordinator Мікросервіси"]
+        C1["Coordinator Под 1<br/>(Активний лідер)"]
+        C2["Coordinator Под 2<br/>(Standby гарячий резерв)"]
+        C1 -.->|"Продовження лізу (кожні 2с)"| Redis
+        C2 -.->|"Відстеження завершення лізу"| Redis
     end
-    
-    ActiveMaster <--> DB
-    
-    subgraph Queue ["Decoupled Task Queue"]
-        ReadyQueue["Ready Priority Queue<br/>(Ordered by scheduled_at)"]
-        DLQ["Dead Letter Queue (DLQ)<br/>(Failed attempts > maxRetries)"]
+
+    C1 -- "Таймер розкладу завдань<br/>Оцінювач залежностей DAG<br/>Reaper завислих воркерів" --> Redis
+
+    subgraph WorkerPool ["3. scheduler-worker Мікросервісні поди"]
+        W1["Воркер-под Alpha<br/>(Місткість: 4 завдання)"]
+        W2["Воркер-под Beta<br/>(Місткість: 4 завдання)"]
     end
-    
-    ActiveMaster -- "1. Enqueue Ready Tasks" --> ReadyQueue
-    ActiveMaster -- "Exceeded Retries" --> DLQ
-    
-    subgraph WorkerPool ["Distributed Worker Pool"]
-        W1["Worker Alpha (Capacity: 4)"]
-        W2["Worker Beta (Capacity: 4)"]
-    end
-    
-    ReadyQueue -- "2. Pull Tasks (Backpressure)" --> W1
-    ReadyQueue -- "2. Pull Tasks (Backpressure)" --> W2
-    
-    W1 -- "Heartbeats (every 2s)" --> ActiveMaster
-    W2 -- "Heartbeats (every 2s)" --> ActiveMaster
-    
-    W1 -- "3. Task Finished Event" --> ActiveMaster
-    W2 -- "3. Task Finished Event" --> ActiveMaster
-    
-    W1 -.->|"Save Status & Output"| DB
-    W2 -.->|"Save Status & Output"| DB
+
+    Redis -- "Pull готових завдань (Backpressure)" --> W1
+    Redis -- "Pull готових завдань (Backpressure)" --> W2
+
+    W1 -- "Heartbeats (кожні 2с)" --> Redis
+    W2 -- "Heartbeats (кожні 2с)" --> Redis
+
+    W1 -.->|"HTTP Вебхуки / Shell скрипти"| TargetSvc["Цільові бізнес-мікросервіси"]
+    W2 -.->|"HTTP Вебхуки / Shell скрипти"| TargetSvc
 ```
 
-### End-to-End Execution Lifecycle
-1. **Job Registration**: User registers a Job with tasks and dependencies via `POST /api/jobs`.
-2. **Trigger Evaluation**:
-   - The active Leader continuously evaluates the scheduling clock.
-   - When a job is ready, a `JobRun` is created and stored in the database.
-3. **DAG Initial Dispatch**:
-   - The DAG engine evaluates task in-degrees. All tasks with $0$ dependencies are marked `QUEUED` and placed in the `ReadyQueue`.
-4. **Worker Execution (Pull Model)**:
-   - Workers query `ReadyQueue.poll()`. If capacity is available, a worker picks up the task and transitions it to `RUNNING`.
-   - The worker executes the action (Shell / HTTP) inside an enforced coroutine/process timeout.
-5. **Task Completion & DAG Propagation**:
-   - Upon completion, the worker reports the result back to the active Coordinator.
-   - The Coordinator transitions the completed task to `COMPLETED` and queries downstream dependent tasks.
-   - Any dependent task whose upstream requirements are now fully satisfied is enqueued immediately.
-   - When all tasks in the DAG reach `COMPLETED`, the `JobRun` is marked `COMPLETED`.
+---
+
+### Діаграма послідовності (Sequence Diagram)
+
+Діаграма демонструє наскрізний життєвий цикл: від реєстрації DAG-пайплайну клієнтським мікросервісом до лідерської координації, паралельного виконання воркерами через HTTP-вебхуки та автоматичного просування графа залежностей.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Клієнтський мікросервіс
+    participant API as scheduler-api (Шлюз)
+    participant Redis as Redis (Сховище, Черга & Лізи)
+    participant Coord as scheduler-coordinator (Лідер)
+    participant W1 as scheduler-worker (Alpha)
+    participant W2 as scheduler-worker (Beta)
+    participant Target as Цільовий мікросервіс (API)
+
+    Note over Coord,Redis: Лідер періодично оновлює свій ліз (SET NX PX)
+    Coord->>Redis: Оновлення лідерського лізу з Fencing Token
+    Redis-->>Coord: Підтверджено (OK)
+
+    Note over Client,API: 1. Реєстрація та запуск DAG завдання
+    Client->>API: POST /api/jobs (Опис DAG: Списання -> Резервування)
+    API->>API: Валідація DAG на цикли (Алгоритм Кана)
+    API->>Redis: Збереження специфікації JobSpec
+    API-->>Client: 201 Created
+
+    Client->>API: POST /api/jobs/{id}/trigger
+    API->>Redis: Створення JobRun (status=RUNNING)
+    API->>Redis: Enqueue Початкових завдань (in-degree=0) у ZSET
+    API-->>Client: 202 Accepted (RunId згенеровано)
+
+    Note over Redis,W1: 2. Worker Alpha бере перше готове завдання (Pull)
+    W1->>Redis: Опитування черги: ZPOPMIN (score <= now)
+    Redis-->>W1: Task 1: "Списання оплати" (HTTP POST)
+    W1->>Redis: Оновлення статусу Task 1: RUNNING (Worker=Alpha)
+
+    par Виконання завдання та фоновий Heartbeat
+        W1->>Target: HTTP POST /v1/charge (з Idempotency-Key)
+        Target-->>W1: 200 OK (Оплату успішно проведено)
+    and Періодичний Heartbeat воркера
+        W1->>Redis: Heartbeat: load=1, activeTasks=[Task 1]
+    end
+
+    W1->>Redis: Оновлення статусу Task 1: COMPLETED
+
+    Note over Coord,Redis: 3. Координатор просуває DAG граф
+    Coord->>Redis: Фоновий тик: перевірка активних запусків
+    Redis-->>Coord: Task 1 завершено! Task 2 залежить від Task 1
+    Coord->>Coord: Обчислення in-degree для Task 2 -> 0 (READY)
+    Coord->>Redis: Enqueue Task 2 у ZSET чергу
+
+    Note over Redis,W2: 4. Worker Beta забирає розблоковане завдання
+    W2->>Redis: Опитування черги: ZPOPMIN
+    Redis-->>W2: Task 2: "Резервування товару" (HTTP POST)
+    W2->>Target: HTTP POST /v1/reserve
+    Target-->>W2: 200 OK (Товар зарезервовано)
+    W2->>Redis: Оновлення статусу Task 2: COMPLETED
+
+    Note over Coord,Redis: 5. Завершення всього пайплайну
+    Coord->>Redis: Усі завдання DAG завершено успішно
+    Coord->>Redis: Оновлення JobRun: status=COMPLETED
+    
+    Client->>API: GET /api/runs/{runId}
+    API->>Redis: Читання стану запуску та завдань
+    Redis-->>API: JobRun COMPLETED з результатами
+    API-->>Client: 200 OK (Пайплайн успішно виконано)
+```
 
 ---
 
-## 3. Deep-Dive Interview Topics
+### Ролі та обов'язки мікросервісів
 
-### At-Least-Once vs. Exactly-Once & Idempotency
-- **Why Exactly-Once is impossible in distributed networks**: The Two Generals' Problem and network partitions mean an execution ack can be lost after a worker successfully finishes.
-- **The Industry Standard Solution**: **At-Least-Once Delivery + Idempotent Execution**:
-  1. Every task instance has a deterministic unique ID: `taskInstanceId = "${runId}-${taskId}-${attempt}"`.
-  2. The storage layer uses **atomic upsert / conditional writes** (`ON CONFLICT(instance_id) DO UPDATE`).
-  3. External actions must accept an **Idempotency Key** so repeated execution does not duplicate side effects.
+| Мікросервіс | Модуль коду | Стратегія масштабування | Основна відповідальність |
+| :--- | :--- | :--- | :--- |
+| **`scheduler-api`** | `scheduler-api` | Без збереження стану (Stateless, $N$ реплік за Ingress) | Вхідний REST API для зовнішніх систем, реєстрація завдань, запит статусу, керування DLQ, вбудований Web Dashboard. |
+| **`scheduler-coordinator`** | `scheduler-coordinator` | Активний-Резервний (Active-Standby, $2$–$3$ репліки) | Годинник розкладу, подовження лідерського лізу, просування залежностей DAG, виявлення та рекламація завислих воркерів. |
+| **`scheduler-worker`** | `scheduler-worker` | Горизонтальне авто-масштабування ($N$ воркер-подів) | Витягування завдань із черги, контроль ліміту місткості, виконання HTTP-вебхуків/скриптів, надсилання heartbeats. |
+| **`scheduler-storage`** | `scheduler-storage` | Спільна бібліотека | Високопродуктивний шар роботи з Redis та SQLite, розподілені лізи та черга затримок на базі пріоритетів. |
+| **`scheduler-common`** | `scheduler-common` | Спільна бібліотека | Доменні моделі даних, рушій DAG на базі алгоритму Кана та парсер 5-значних Cron-виразів. |
 
-### Split-Brain Protection & Fencing Tokens
-- **The Problem**: If an active Master experiences a long GC pause or transient network partition, standby masters assume it died and elect a new leader. When the old master wakes up, both masters might dispatch conflicting tasks (**Split-Brain**).
-- **The Solution (Martin Kleppmann Fencing Tokens)**:
-  1. Every time leadership changes, the coordination store increments a monotonic **fencing token** ($E_{k+1} = E_k + 1$).
-  2. Every task queued or state persisted by the leader carries this token.
-  3. Workers and storage reject any commands carrying a token strictly lower than the latest known active token.
+---
 
-### High-Precision Delayed Scheduling (Two-Tier Bucketing)
-- **The Naive Mistake**: `SELECT * FROM jobs WHERE scheduled_at <= NOW()` every second causes database table locks and burns CPU under millions of records.
-- **The Interview Solution (Two-Tier Scheduling)**:
-  1. **Tier 1 (Database / Cold Store)**: Stores all future jobs. A pre-fetcher process queries in 1-minute batches (`scheduled_at BETWEEN NOW() AND NOW() + 1 minute`).
-  2. **Tier 2 (In-Memory / Hot Store)**: Hot jobs for the current minute are placed in an in-memory **Min-Heap (Priority Queue)** or **Redis Sorted Set (`ZSET`)** keyed by timestamp. The dispatch clock only sleeps until the top item is due.
+## 2. Системний дизайн: Шаблон для співбесід
 
-### Push vs. Pull Task Dispatch & Backpressure
-- **Push Model Flaws**: Coordinator pushes tasks to workers. If Worker A is running slow tasks, it gets overloaded while Worker B is idle, requiring complex remote load-tracking.
-- **Pull Model Advantages (Used here)**: Workers pull from the queue only when `currentLoad < capacity`. This provides **natural load balancing** and **backpressure** without coordinator overhead.
+### Функціональні та нефункціональні вимоги
 
-### DAG Orchestration via Topological In-Degree
-- **Validation**: At submission, `DAGEngine.validateAndSort()` uses **Kahn's Algorithm**:
-  $$\text{inDegree}(v) = \text{number of upstream dependencies}$$
-  If the number of topologically sorted nodes does not equal total tasks, a cycle exists and the submission is rejected immediately.
-- **Runtime Progression**: When Task $U$ completes, the Coordinator queries all dependent tasks $V$. If $\forall P \in \text{parents}(V), \text{status}(P) == \text{COMPLETED}$, Task $V$ is enqueued.
+#### Функціональні вимоги
+1. **Гнучке планування за часом**:
+   - **Одноразові відкладені завдання**: Запуск у чітко визначений момент часу в майбутньому ($T$).
+   - **Періодичні Cron-розклади**: Стандартний синтаксис із 5 полів (`хвилина година деньМісяця місяць деньТижня`) та пресети (`@daily`, `@hourly` тощо).
+   - **Миттєвий запуск**: Тригер виконання робочого процесу на вимогу через REST API.
+2. **Залежності робочих процесів (DAG)**:
+   - Завдання можуть декларувати залежності від інших завдань (спрямований ациклічний граф).
+   - Попередня валідація на відсутність циклічних блокувань за **алгоритмом Кана**.
+   - Дочірні завдання запускаються лише після успішного статусу `COMPLETED` для всіх батьківських кроків.
+3. **Пул ізольованих воркерів**:
+   - Мікросервісні воркери самостійно забирають роботу (Pull model), враховують власну апаратну місткість та примусово обмежують час виконання (Timeout).
+4. **Відмовостійкість та самовідновлення**:
+   - **Виявлення збоїв воркерів**: Моніторинг heartbeats; якщо воркер припиняє надсилати сигнали, його завдання вилучаються та перевиставляються на виконання.
+   - **Автоматичні повтори (Retries)**: Експоненційне відтермінування з додаванням випадкового джитеру (Jitter).
+   - **Черга мертвих листів (DLQ)**: Завдання, що вичерпали ліміт `maxRetries`, ізолюються в DLQ із діагностикою помилки та можливістю ручного перезапуску.
+5. **Спостережуваність (Observability)**:
+   - REST API для перевірки здоров'я кластера, навантаження воркерів та історії запусків.
+   - Вбудована веб-панель для моніторингу топології та прогресу виконання DAG у реальному часі.
 
-### Worker Health, Heartbeats & Task Reclamation
-- Workers emit heartbeats every 2 seconds: `WorkerInfo(workerId, capacity, currentLoad, activeTasks)`.
-- If $T_{\text{now}} - T_{\text{lastHeartbeat}} > 8\text{ seconds}$, the Coordinator **Reaper** marks the worker `DEAD`.
-- All tasks assigned to the dead worker are reclaimed and requeued with backoff.
+#### Нефункціональні вимоги
+- **Висока доступність (HA)**: Автоматичне перемикання Active-Standby координаторів без простою системи.
+- **Точність**: Похибка запуску завдань у межах $\pm 1$ секунди від запланованого часу.
+- **Ідемпотентність**: Запобігання повторному виконанню через токени розмежування (fencing tokens) та ключі ідемпотентності.
+- **Масштабованість**: Горизонтальне масштабування воркерів за допомогою Kubernetes HPA без додаткового навантаження на координатор.
 
-### Exponential Backoff with Jitter & Dead Letter Queue (DLQ)
-- Retries calculate delay using truncated exponential backoff with full jitter:
+### Оцінка пропускної здатності та масштаб
+- **Щоденний обсяг завдань**: $100\text{ млн запусків/день} \approx 1{,}160\text{ завдань/сек}$ у середньому (пікове навантаження $5{,}000\text{ завдань/сек}$).
+- **Сховище метаданих**: $1\text{ КБ}$ на визначення завдання $\times 10\text{ млн завдань} = 10\text{ ГБ}$.
+- **Журнал виконання**: $2\text{ КБ}$ на запис виконання $\times 100\text{ млн запусків/день} = 200\text{ ГБ/день}$ (зберігання з TTL та холодним архівуванням).
+
+---
+
+## 3. Поглиблені теми для системного дизайну
+
+### Доставка «щонайменше один раз» (At-Least-Once) та міжсервісна ідемпотентність
+- **Чому гарантія Exactly-Once неможлива**: Проблема двох генералів та мережеві збої унеможливлюють абсолютну гарантію доставки без ризику втрати повідомлення.
+- **Архітектурне рішення**: **At-Least-Once доставка + Ідемпотентні приймачі**:
+  1. Кожен екземпляр завдання має детермінований унікальний ID: `taskInstanceId = "${runId}-${taskId}-${attempt}"`.
+  2. База даних використовує **атомарні оновлення за умовою** (`ON CONFLICT(instance_id) DO UPDATE`).
+  3. Під час виклику зовнішніх мікросервісів через HTTP воркери передають заголовок `Idempotency-Key: ${taskInstanceId}`.
+
+### Захист від Split-Brain через монотонні токени розмежування (Fencing Tokens)
+- **Проблема**: Якщо активний Master зависає через тривалу GC-паузу або мережеву затримку, резервний вузол оголошує себе лідером. Коли старий Master відновлює роботу, виникає ситуація **розщеплення мозку (Split-Brain)**, коли два вузли одночасно керують чергою.
+- **Рішення (Martin Kleppmann Fencing Tokens)**:
+  1. Кожне нове обрання лідера супроводжується атомарним інкрементом монотонного лічильника: $E_{k+1} = E_k + 1$.
+  2. Кожне завдання чи операція збереження стану маркується цим токеном.
+  3. Воркери та шар збереження даних відкидають будь-які операції від лідерів із застарілим токеном.
+
+### Високоточне відкладене планування (Дворівнева бакетизація часу)
+- **Поширена помилка на співбесіді**: Виконання SQL-запиту `SELECT * FROM jobs WHERE scheduled_at <= NOW()` щосекунди створює колосальне навантаження на БД при мільйонах записів.
+- **Дворівневий підхід (Two-Tier Scheduling)**:
+  1. **Рівень 1 (Дискова БД / Холодне сховище)**: Зберігає всі завдання на дні та місяці вперед. Фонові префетчери щохвилини вибирають батч на наступні 60 секунд.
+  2. **Рівень 2 (In-Memory / Гаряча черга)**: Завдання на поточну хвилину потрапляють у **Min-Heap (пріоритетну чергу)** або **Redis Sorted Set (`ZSET`)**, де ключем є timestamp. Потік диспетчера спить рівно до часу настання найближчого завдання.
+
+### Модель диспетчеризації: Push проти Pull та Backpressure
+- **Недоліки Push-моделі**: Майстер надсилає завдання безпосередньо воркеру. Якщо Воркер A зайнятий важким обчисленням, він перевантажується, тоді як Воркер B простоює.
+- **Переваги Pull-моделі (реалізовано тут)**: Воркери витягують нові завдання з черги тільки за наявності вільних ресурсів (`currentLoad < capacity`). Це забезпечує **природне балансування навантаження** та захист від перевантаження (**Backpressure**).
+
+### Оркестрація DAG через алгоритм Кана (Kahn's Algorithm)
+- **Валідація графа**: Під час реєстрації завдання перевіряються за допомогою алгоритму Кана:
+  $$\text{inDegree}(v) = \text{кількість незавершених вхідних залежностей}$$
+  Якщо довжина топологічно відсортованого списку менша за загальну кількість завдань, граф містить цикл і відхиляється на етапі валідації.
+- **Динамічний рух графа**: Коли Task $U$ переходить у статус `COMPLETED`, координатор перевіряє всі залежні завдання $V$. Якщо для всіх батьківських кроків $P$ статус дорівнює `COMPLETED`, Task $V$ автоматично стає в чергу на виконання.
+
+### Моніторинг воркерів, Heartbeats та рекламація завдань
+- Кожні 2 секунди воркери надсилають heartbeat: `WorkerInfo(workerId, capacity, currentLoad, activeTasks)`.
+- Якщо $T_{\text{now}} - T_{\text{lastHeartbeat}} > 8\text{ секунд}$, фоновий процес **Reaper** оголошує воркер мертвим (`DEAD`).
+- Усі незавершені завдання цього воркера негайно рекламуються та перевиставляються в чергу з оновленням лічильника спроб.
+
+### Експоненційне відтермінування з джитером (Exponential Backoff with Jitter) та черга DLQ
+- Пауза між повторними спробами розраховується з додаванням псевдовипадкового джитеру:
   $$\text{delay} = \min(\text{maxBackoff}, \text{base} \times 2^{\text{attempt}-1}) + \text{random}(0, \text{jitter})$$
-- Jitter prevents the **Thundering Herd** problem where thousands of retrying workers strike an upstream database at the exact same second.
-- Once `attempt > maxRetries`, the task moves to the **Dead Letter Queue (DLQ)** for operator inspection and replay.
+- Джитер запобігає проблемі **«громового стада» (Thundering Herd)**, коли тисячі воркерів одночасно штурмують зовнішній сервіс після збою.
+- Якщо `attempt > maxRetries`, завдання скеровується в **Dead Letter Queue (DLQ)** для ручного аудиту та повторного запуску.
 
 ---
 
-## 4. Codebase Architecture & File Mapping
+### Детальне архітектурне обґрунтування: Чому обрано Redis замість Kafka
+
+Типове запитання на System Design інтерв'ю:  
+> **«Чому для черги планувальника та координації обрано Redis, а не Apache Kafka?»**
+
+Хоча Kafka є неперевершеним інструментом для потокового оброблення подій (Event Streaming), її використання як **черги планувальника завдань** призводить до фундаментальних архітектурних протиріч:
+
+#### Порівняльна матриця можливостей
+
+| Характеристика | Redis (`ZSET` / Streams) | Apache Kafka | Переможець для планувальника |
+| :--- | :--- | :--- | :---: |
+| **Планування на довільний час у майбутньому** | **Нативно ($O(\log N)$)** через `ZSET`, де `score = scheduled_epoch_ms`. Воркери забирають завдання, де `score <= now`. | **Не підтримується нативно**. Kafka є строго послідовним логом запису (append-only) і не може сортувати повідомлення за часом. | 🏆 **Redis** |
+| **Вибірковий ACK та ізольовані повтори (Retries)** | **Підтримується**. Воркери забирають окремі завдання. Помилка одного кроку не блокує інші паралельні завдання. | **Проблема Head-of-Line Blocking**. Зміщення (Offset) комітяться послідовно. Неможливо відкласти повідомлення 42, підтвердивши 43. | 🏆 **Redis** |
+| **Пріоритетні черги** | **Нативно**. Завдання сортуються за вагою або розподіляються за рівнями пріоритету (`BLPOP high med low`). | **Немає пріоритету всередині партиції**. Усі повідомлення строго FIFO. Потрібні окремі топіки під кожен рівень. | 🏆 **Redis** |
+| **Розподілені блокування та вибори лідера** | **Нативно та атомарно** за допомогою команди `SET lock_key token NX PX duration`. | **Не підтримується**. Kafka не надає клієнтам API для координації та лізингових блокувань. | 🏆 **Redis** |
+| **Динамічне масштабування воркерів** | **Динамічно**. Будь-яка кількість воркерів ($N$) може паралельно витягувати завдання з однієї черги. | **Обмежено партиціями**. Кількість активних консьюмерів у групі не може перевищувати кількість партицій ($N \le \text{partitions}$). | 🏆 **Redis** |
+| **Пропускна здатність** | Висока ($50\text{k} - 100\text{k}$ оп/сек на вузол), лімітована оперативною пам'яттю (RAM). | **Колосальна ($1\text{M}+$ подій/сек)** завдяки послідовному запису на диск та OS Page Cache. | 🏆 **Kafka** |
+| **Зберігання історії та повторне програвання** | In-Memory з періодичними знімками (AOF/RDB). Оптимально для активних/транзитних завдань. | **Незмінний журнал фіксацій**. Зберігає терабайти історії тижнями; дозволяє повний replay з нульового зміщення. | 🏆 **Kafka** |
+| **Складність супроводу** | **Мінімальна**. Один легковажний бінарник або керований хмарний інстанс. | **Висока**. Потребує кворуму KRaft/ZooKeeper, балансування партицій, тюнінгу консьюмер-груп. | 🏆 **Redis** |
+
+#### Чому Kafka не підходить на роль ядра планувальника:
+1. **Відсутність затримок (Блокування партиції через FIFO)**:
+   Якщо Завдання B заплановане на 14:00, а Завдання A на 10:05, у лозі Kafka вони запишуться по черзі:
+   ```
+   [Offset 0: Завдання B (Час: 14:00)] ----> [Offset 1: Завдання A (Час: 10:05)]
+   ```
+   Оскільки консьюмер читає партицію послідовно, дійшовши до Offset 0, він змушений **заблокувати читання всієї партиції на 4 години**, блокуючи виконання Завдання A.
+2. **Head-of-Line Blocking під час повторних спроб**:
+   Зміщення в Kafka монотонні. Якщо Завдання 2 зазнало збою та потребує повтору через 30 секунд, не можна підтвердити Завдання 3 без ризику втрати Завдання 2 при падінні воркера. Створення кілець топіків повторів (`retry-1m`, `retry-5m`) створює надмірне операційне навантаження.
+3. **Обмеження кількості воркерів партиціями**:
+   Якщо топік розбито на 8 партицій, то навіть під час масштабування пулу воркерів у Kubernetes до 16 подів — **8 подів простоюватимуть без роботи**. У Redis же сотні подів можуть одночасно розбирати одну спільну чергу.
+
+#### Продакшн-патерн: Гібридна архітектура
+У високонавантажених системах (Uber Cadence, Temporal, Netflix Conductor) обидва інструменти працюють у синергії:
+
+```mermaid
+flowchart TD
+    Client["Клієнтські мікросервіси"] -->|"1. Масовий потік бізнес-подій<br/>(100k+ подій/сек)"| KafkaIngest["Apache Kafka<br/>(Вхідний буфер подій)"]
+    
+    KafkaIngest -->|"2. Читання подій"| SchedulerCoord["Scheduler Coordinator Под"]
+    
+    subgraph Scheduler Engine [Ядро планувальника: Redis]
+        SchedulerCoord -->|"3. Планування затримок та<br/>подовження лідерського лізу"| Redis["Redis 7<br/>• ZSET черга затримок<br/>• Атомарні лізи (SET NX)<br/>• Активний стан DAG"]
+        Redis -->|"4. Витягування готових завдань"| Workers["Воркер-поди"]
+    end
+    
+    Workers -->|"5. Публікація аудит-журналу та результатів"| KafkaAudit["Apache Kafka<br/>(Журнал аудиту запусків)"]
+    KafkaAudit --> Lake["Data Lake / Аналітика"]
+```
+
+- **Kafka на вході**: Поглинає величезні сплески вхідних подій з високою швидкістю.
+- **Redis у центрі**: Забезпечує роботу рушія завдань — перевірку умов DAG, похвилинну/посекундну точність через `ZSET` та арбітраж лідера.
+- **Kafka на виході**: Зберігає повний незмінний аудит усіх запусків для аналітики та довгострокового збереження.
+
+---
+
+## 4. Багатомодульна структура кодової бази
 
 ```
 job-scheduler/
-├── src/main/kotlin/com/tarashor/scheduler/
-│   ├── Main.kt                           # Cluster bootstrap entrypoint
-│   ├── core/
-│   │   ├── model/Models.kt               # Domain data models (JobSpec, TaskSpec, DAG, Lease, DLQ)
-│   │   ├── cron/CronParser.kt            # 5-field Cron parser with interval & preset support
-│   │   └── dag/DAGEngine.kt              # Topological sort, cycle detector (Kahn's), DAG state machine
-│   ├── cluster/
-│   │   └── LeaderElection.kt             # Leased leader election with Monotonic Fencing Tokens
-│   ├── queue/
-│   │   └── TaskQueue.kt                  # Decoupled Priority Queue, Exponential Backoff & DLQ
-│   ├── storage/
-│   │   └── Storage.kt                    # Clean Repository Pattern (InMemory & Persistent SQLite)
-│   ├── worker/
-│   │   ├── TaskRunner.kt                 # Sandboxed runners: Shell commands, HTTP calls, Simulation
-│   │   └── WorkerNode.kt                 # Pull-based worker with heartbeat agent & timeout protection
-│   ├── coordinator/
-│   │   └── SchedulerCoordinator.kt       # Master brain: schedule clock, DAG resolver, failure reaper
-│   ├── api/
-│   │   └── SchedulerApiServer.kt         # Ktor REST API endpoints & CORS configuration
-│   └── ui/
-│       └── DashboardHtml.kt              # Embedded real-time Web Dashboard
-├── src/main/resources/
-│   └── static/index.html                 # Modern, responsive Web UI dashboard template
-└── src/test/kotlin/com/tarashor/scheduler/
-    ├── CronParserTest.kt                 # Cron syntax, intervals, and leap-time edge cases
-    ├── DAGValidatorTest.kt               # Kahn's topological sort, diamond DAG, cycle detection
-    ├── LeaderElectionTest.kt             # Mutual exclusion, lease renewal, automated failover
-    ├── TaskQueueAndDLQTest.kt            # Priority polling, backoff math, DLQ routing & replay
-    └── EndToEndSchedulerTest.kt          # Full integration: 3-stage DAG execution & worker crash reclamation
+├── docker-compose.yml                    # Оркестрація мультиконтейнерного кластера
+├── docker/
+│   └── Dockerfile                        # Багатоетапна збірка контейнерних образів
+├── scheduler-common/                     # [Спільна бібліотека]
+│   └── src/main/kotlin/com/tarashor/scheduler/core/
+│       ├── model/Models.kt               # Доменні моделі даних та DTO
+│       ├── cron/CronParser.kt            # Парсер 5-значних Cron-виразів
+│       └── dag/DAGEngine.kt              # Топологічне сортування за алгоритмом Кана
+├── scheduler-storage/                    # [Спільний шар даних]
+│   └── src/main/kotlin/com/tarashor/scheduler/
+│       ├── storage/Storage.kt            # Інтерфейси сховища та реалізація для SQLite
+│       ├── storage/RedisStorage.kt       # Черга затримок Redis ZSET та лізинговий механізм
+│       └── storage/StorageFactory.kt     # Автоконфігурація сховища зі змінних середовища
+├── scheduler-api/                        # [Мікросервіс 1]
+│   └── src/main/kotlin/com/tarashor/scheduler/
+│       ├── api/ApiApp.kt                 # Головна точка входу API-мікросервісу
+│       ├── api/SchedulerApiServer.kt     # Маршрути Ktor REST API та налаштування CORS
+│       └── ui/DashboardHtml.kt           # Вбудована односторінкова веб-панель
+├── scheduler-coordinator/                # [Мікросервіс 2]
+│   └── src/main/kotlin/com/tarashor/scheduler/coordinator/
+│       ├── CoordinatorApp.kt             # Головна точка входу координатора
+│       └── SchedulerCoordinator.kt       # Вибори лідера, годинник розкладу та стан DAG
+└── scheduler-worker/                     # [Мікросервіс 3]
+    └── src/main/kotlin/com/tarashor/scheduler/worker/
+        ├── WorkerApp.kt                  # Головна точка входу воркера
+        ├── WorkerNode.kt                 # Цикл опитування черги, керування місткістю та heartbeats
+        └── TaskRunner.kt                 # Середовище виконання: HTTP-вебхуки, Shell-скрипти
 ```
 
 ---
 
-## 5. Quickstart & Running Locally
+## 5. Запуск мікросервісів
 
-### Prerequisites
-- JDK 25 or 26 (foojay toolchain resolver included)
-- macOS / Linux / Windows
+### Варіант A: Docker Compose (Повний розподілений кластер)
 
-### Running the Cluster
-Run the standalone cluster with one command:
+Запуск повноцінного розподіленого мікросервісного кластера однією командою:
 ```bash
-./gradlew run
+docker-compose up --build
 ```
 
-This starts:
-1. **Master Coordinator** (`active-master`) on port `8080` with active leadership and fencing token `1`.
-2. **Two Worker Nodes** (`worker-alpha` and `worker-beta`), each with capacity 4.
-3. **SQLite Persistent Database** (`scheduler.db`).
-4. **Pre-configured Jobs**:
-   - `system-heartbeat-cron`: Recurring cron running every 5 minutes (`*/5 * * * *`).
-   - `sample-etl-dag`: 4-stage sequential + branching DAG (`extract-sales` + `extract-inventory` $\rightarrow$ `transform-metrics` $\rightarrow$ `load-warehouse`).
+Ця команда розгортає:
+- **`scheduler-redis`**: Розподілене сховище Redis та черга на порті `6379`.
+- **`scheduler-api-service`**: API-шлюз та Web UI на адресі `http://localhost:8080`.
+- **`scheduler-coordinator-primary`**: Основний активний координатор (лідер).
+- **`scheduler-coordinator-standby`**: Резервний координатор для демонстрації failover.
+- **`scheduler-worker-alpha`**: Перший воркер-под (місткість: 4 завдання).
+- **`scheduler-worker-beta`**: Другий воркер-под (місткість: 4 завдання).
 
 ---
 
-### Interactive Web Dashboard
-Open your browser to:
+### Варіант B: Локальні Gradle-сервіси (Режим розробки)
+
+Кожен мікросервіс можна запустити окремо у власному терміналі:
+
+```bash
+# Термінал 1: Запуск API-мікросервісу
+./gradlew :scheduler-api:run
+
+# Термінал 2: Запуск майстер-координатора
+./gradlew :scheduler-coordinator:run
+
+# Термінал 3: Запуск воркер-пода Alpha
+WORKER_ID=worker-alpha ./gradlew :scheduler-worker:run
+
+# Термінал 4: Запуск воркер-пода Beta
+WORKER_ID=worker-beta ./gradlew :scheduler-worker:run
+```
+
+---
+
+### Інтерактивна веб-панель керування (Dashboard)
+Відкрийте у браузері:
 👉 **[http://localhost:8080/](http://localhost:8080/)**
 
-The dashboard provides real-time visualization of:
-- **Cluster Topology**: Active leader node, current fencing token, active worker count.
-- **Cluster Workers**: Worker status, capacity, current concurrency, active task assignments, heartbeat latency.
-- **Registered Jobs**: List of jobs, schedules, and DAG structures.
-- **Live DAG Runs**: Step-by-step visual execution state (`QUEUED` $\rightarrow$ `RUNNING` $\rightarrow$ `COMPLETED`).
-- **Dead Letter Queue (DLQ)**: View terminal failures with error traces and click **"Retry"** to replay.
-- **Simulate Leader Failover**: Click the orange button to force the active leader to step down and watch a standby take over with an incremented fencing token!
+Панель надає візуальний контроль у реальному часі:
+- **Топологія кластера**: Активний лідер, поточний Fencing Token, кількість зареєстрованих воркерів.
+- **Воркери**: Статус працездатності, місткість, поточне завантаження, затримка heartbeat.
+- **Визначені завдання**: Перелік завдань, cron-розклади та графічна структура DAG.
+- **Активні запуски**: Покроковий стан виконання завдань (`QUEUED` $\rightarrow$ `RUNNING` $\rightarrow$ `COMPLETED`).
+- **Черга мертвих листів (DLQ)**: Перегляд помилок та кнопка **«Retry»** для повторного запуску.
+- **Симуляція аварії лідера**: Кнопка ручного складання повноважень лідера для спостереження за автоматичним перехопленням лідерства резервним координатором.
 
 ---
 
-### REST API Reference & cURL Examples
+### Приклади REST API для клієнтських мікросервісів
 
-#### 1. Cluster Health & Leadership
+#### 1. Перевірка здоров'я кластера та активного лідера
 ```bash
 curl -s http://localhost:8080/api/health | jq
 ```
 ```json
 {
-  "coordinatorId": "active-master",
+  "coordinatorId": "coordinator-primary",
   "isLeader": true,
   "fencingToken": 1,
   "queueSize": 0,
@@ -268,34 +401,49 @@ curl -s http://localhost:8080/api/health | jq
 }
 ```
 
-#### 2. Submit a New DAG Job
+#### 2. Реєстрація міжсервісного DAG-робочого процесу
 ```bash
 curl -X POST http://localhost:8080/api/jobs \
   -H "Content-Type: application/json" \
   -d '{
-    "jobId": "order-processing-pipeline",
-    "name": "Order Processing Pipeline",
+    "jobId": "order-fulfillment-workflow",
+    "name": "Order Fulfillment Workflow",
     "schedule": { "type": "Immediate" },
     "tasks": [
       {
-        "taskId": "validate-payment",
-        "name": "Validate Payment",
-        "action": { "type": "Shell", "command": "echo Payment approved" },
+        "taskId": "charge-payment",
+        "name": "Charge Payment",
+        "action": { 
+          "type": "Http", 
+          "url": "https://api.payment-service.internal/v1/charge",
+          "method": "POST",
+          "body": "{\"orderId\": \"ORD-9912\", \"amount\": 149.99}"
+        },
         "timeoutMs": 5000,
         "maxRetries": 3
       },
       {
         "taskId": "reserve-inventory",
         "name": "Reserve Inventory",
-        "action": { "type": "Shell", "command": "echo Inventory reserved" },
+        "action": { 
+          "type": "Http", 
+          "url": "https://api.inventory-service.internal/v1/reserve",
+          "method": "POST",
+          "body": "{\"sku\": \"WIDGET-01\", \"quantity\": 2}"
+        },
         "timeoutMs": 5000,
         "maxRetries": 3
       },
       {
-        "taskId": "generate-invoice",
-        "name": "Generate Invoice",
-        "dependencies": ["validate-payment", "reserve-inventory"],
-        "action": { "type": "Shell", "command": "echo Invoice generated" },
+        "taskId": "dispatch-shipment",
+        "name": "Dispatch Shipment",
+        "dependencies": ["charge-payment", "reserve-inventory"],
+        "action": { 
+          "type": "Http", 
+          "url": "https://api.shipping-service.internal/v1/dispatch",
+          "method": "POST",
+          "body": "{\"orderId\": \"ORD-9912\"}"
+        },
         "timeoutMs": 5000,
         "maxRetries": 3
       }
@@ -303,48 +451,37 @@ curl -X POST http://localhost:8080/api/jobs \
   }'
 ```
 
-#### 3. Trigger a Job Manually
+#### 3. Ручний запуск завдання
 ```bash
-curl -X POST http://localhost:8080/api/jobs/sample-etl-dag/trigger
+curl -X POST http://localhost:8080/api/jobs/order-fulfillment-workflow/trigger
 ```
 
-#### 4. Query Recent Execution Runs & DAG Progress
+#### 4. Запит прогресу виконання графа DAG
 ```bash
 curl -s http://localhost:8080/api/runs | jq
 ```
 
-#### 5. Trigger Leader Failover
+#### 5. Симуляція збою лідера (Failover)
 ```bash
 curl -X POST http://localhost:8080/api/cluster/stepdown
 ```
 
-#### 6. Inspect & Retry DLQ Tasks
-```bash
-# List DLQ entries
-curl -s http://localhost:8080/api/dlq | jq
-
-# Replay a failed DLQ entry
-curl -X POST http://localhost:8080/api/dlq/<entry-id>/retry
-```
-
 ---
 
-## 6. Running the Test Suite
+## 6. Верифікація тестового набору
 
-The test suite thoroughly verifies all distributed systems guarantees:
+Запуск повного набору модульних та інтеграційних тестів:
 ```bash
 ./gradlew test
 ```
 
-| Test Class | Verified Capabilities |
+| Субпроєкт | Що перевіряється тестами |
 | :--- | :--- |
-| **`CronParserTest`** | Standard 5-field cron parsing, steps (`*/5`), ranges (`1-5`), named weekdays (`MON`), and presets (`@daily`). |
-| **`DAGValidatorTest`** | Kahn's algorithm topological sorting, diamond dependencies, cycle detection, and self-loop rejection. |
-| **`LeaderElectionTest`** | Lease acquisition, mutual exclusion, lease renewal, manual stepdown, and standby takeover with fencing token increment. |
-| **`TaskQueueAndDLQTest`** | Priority order by `scheduled_at`, exponential backoff delay calculation, DLQ routing upon retry exhaustion, and replay. |
-| **`EndToEndSchedulerTest`** | Full end-to-end DAG execution across workers in strict dependency order, plus worker heartbeat timeout & task reclamation by the Reaper. |
+| **`scheduler-common`** | Парсинг Cron-виразів, кроки (`*/5`), діапазони (`1-5`), пресети (`@daily`), сортування за алгоритмом Кана, ромбовидні DAG-залежності, детекція циклів. |
+| **`scheduler-storage`** | Атомарне взяття лізу, взаємне виключення, продовження лізу, витягування з пріоритетної черги затримок, математика backoff-джитеру, ізоляція та повтор у DLQ. |
+| **`scheduler-coordinator`** | Наскрізне виконання багатокрокового DAG воркерами, виявлення збою воркера за таймаутом heartbeat та автоматична рекламація завдань процесом Reaper. |
 
 ---
 
-## License
+## Ліцензія
 MIT

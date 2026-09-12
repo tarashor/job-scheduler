@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  # -------------------------------------------------------------
+  # Shared Coordination & Distributed Task Queue
+  # -------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: scheduler-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+
+  # -------------------------------------------------------------
+  # Microservice 1: REST API Gateway & Web Dashboard
+  # -------------------------------------------------------------
+  scheduler-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: api
+    container_name: scheduler-api-service
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PORT=8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # -------------------------------------------------------------
+  # Microservice 2: Active Master Coordinator (Leader)
+  # -------------------------------------------------------------
+  scheduler-coordinator-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: coordinator
+    container_name: scheduler-coordinator-primary
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - COORDINATOR_ID=coordinator-primary
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # -------------------------------------------------------------
+  # Microservice 2b: Standby Coordinator (Automated Failover)
+  # -------------------------------------------------------------
+  scheduler-coordinator-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: coordinator
+    container_name: scheduler-coordinator-standby
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - COORDINATOR_ID=coordinator-standby
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # -------------------------------------------------------------
+  # Microservice 3: Worker Daemon Pod 1
+  # -------------------------------------------------------------
+  scheduler-worker-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: worker
+    container_name: scheduler-worker-alpha
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - WORKER_ID=worker-alpha
+      - WORKER_CAPACITY=4
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # -------------------------------------------------------------
+  # Microservice 3b: Worker Daemon Pod 2 (Horizontal Scale)
+  # -------------------------------------------------------------
+  scheduler-worker-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: worker
+    container_name: scheduler-worker-beta
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - WORKER_ID=worker-beta
+      - WORKER_CAPACITY=4
+    depends_on:
+      redis:
+        condition: service_healthy
