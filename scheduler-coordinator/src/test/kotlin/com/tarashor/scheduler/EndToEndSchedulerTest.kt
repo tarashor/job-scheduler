@@ -4,7 +4,7 @@ import com.tarashor.scheduler.cluster.InMemoryLeaseStore
 import com.tarashor.scheduler.coordinator.SchedulerCoordinator
 import com.tarashor.scheduler.core.model.*
 import com.tarashor.scheduler.queue.InMemoryTaskQueue
-import com.tarashor.scheduler.storage.InMemorySchedulerStorage
+import com.tarashor.scheduler.storage.*
 import com.tarashor.scheduler.worker.WorkerNode
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -141,6 +141,80 @@ class EndToEndSchedulerTest {
         assertNotNull(updatedTask)
         assertEquals(TaskStatus.RETRYING, updatedTask.status, "Task should have been reclaimed and set to RETRYING")
 
+        coordinator.stop()
+    }
+
+    @Test
+    fun `test Database-per-Microservice decoupled orchestration`() = runBlocking {
+        // 1. API owns its isolated JobMetadataStore (job specs only)
+        val apiMetadataStore = InMemoryJobMetadataStore()
+
+        // 2. History service owns its isolated RunHistoryStore (runs and execution logs)
+        val historyStore = InMemoryRunHistoryStore()
+
+        // 3. Coordinator/Queue layer owns LeaseStore, WorkerRegistry, and TaskQueue
+        val leaseStore = InMemoryLeaseStore()
+        val workerRegistry = InMemoryWorkerRegistry()
+        val taskQueue = InMemoryTaskQueue()
+
+        val coordinator = SchedulerCoordinator(
+            coordinatorId = "coord-decoupled",
+            leaseStore = leaseStore,
+            jobMetadataStore = apiMetadataStore,
+            runHistoryStore = historyStore,
+            workerRegistry = workerRegistry,
+            taskQueue = taskQueue,
+            tickIntervalMs = 200
+        )
+        coordinator.start()
+
+        // 4. Worker is Stateless: only has taskQueue, workerRegistry, and historyStore (NO access to apiMetadataStore!)
+        val statelessWorker = WorkerNode(
+            workerId = "stateless-worker-1",
+            capacity = 2,
+            taskQueue = taskQueue,
+            workerRegistry = workerRegistry,
+            runHistoryStore = historyStore,
+            heartbeatIntervalMs = 300,
+            onTaskCompleted = { task, result ->
+                coordinator.handleTaskCompletion(task, result)
+            }
+        )
+        statelessWorker.start()
+
+        delay(600)
+        assertTrue(coordinator.isLeader())
+
+        // Create job in API's store only
+        val job = JobSpec(
+            jobId = "decoupled-job",
+            name = "Decoupled Architecture Test",
+            schedule = ScheduleSpec.Immediate,
+            tasks = listOf(
+                TaskSpec("step-1", "Echo Hello", dependencies = emptySet(), action = TaskAction.Shell("echo hello"))
+            )
+        )
+        apiMetadataStore.saveJob(job)
+
+        // Trigger job execution
+        val triggeredRun = coordinator.triggerJob("decoupled-job", triggerSource = "API_EVENT")
+        assertNotNull(triggeredRun)
+        val runId = triggeredRun.runId
+
+        // Wait for execution
+        delay(1200)
+
+        // Verify status in HistoryStore
+        val run = historyStore.getRun(runId)
+        assertNotNull(run)
+        assertEquals(JobStatus.COMPLETED, run.status)
+
+        val taskInstances = historyStore.getTaskInstancesForRun(runId)
+        assertEquals(1, taskInstances.size)
+        assertEquals(TaskStatus.COMPLETED, taskInstances[0].status)
+        assertEquals("stateless-worker-1", taskInstances[0].assignedWorkerId)
+
+        statelessWorker.stop()
         coordinator.stop()
     }
 }

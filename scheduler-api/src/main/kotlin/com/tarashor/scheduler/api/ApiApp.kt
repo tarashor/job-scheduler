@@ -8,10 +8,12 @@ fun main() {
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
     logger.info("Starting Scheduler API Gateway Microservice on port $port...")
 
-    val bundle = StorageFactory.createFromEnv()
+    val bundle = StorageFactory.createApiStorageFromEnv()
     val server = SchedulerApiServer(
         port = port,
-        storage = bundle.storage,
+        jobMetadataStore = bundle.jobMetadataStore,
+        runHistoryStore = bundle.runHistoryStore,
+        workerRegistry = bundle.workerRegistry,
         taskQueue = bundle.taskQueue,
         leaseStore = bundle.leaseStore
     )

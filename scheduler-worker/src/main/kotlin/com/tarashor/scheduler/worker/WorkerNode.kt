@@ -2,7 +2,9 @@ package com.tarashor.scheduler.worker
 
 import com.tarashor.scheduler.core.model.*
 import com.tarashor.scheduler.queue.TaskQueue
+import com.tarashor.scheduler.storage.RunHistoryStore
 import com.tarashor.scheduler.storage.SchedulerStorage
+import com.tarashor.scheduler.storage.WorkerRegistry
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
@@ -13,11 +15,31 @@ class WorkerNode(
     val workerId: String,
     val capacity: Int = 4,
     private val taskQueue: TaskQueue,
-    private val storage: SchedulerStorage,
+    private val workerRegistry: WorkerRegistry,
+    private val runHistoryStore: RunHistoryStore? = null,
     private val taskRunner: TaskRunner = DefaultTaskRunner(),
     private val heartbeatIntervalMs: Long = 2_000,
     private val onTaskCompleted: (suspend (TaskInstance, TaskExecutionResult) -> Unit)? = null
 ) {
+    // Backward-compatible constructor for monolithic/composite storage
+    constructor(
+        workerId: String,
+        capacity: Int = 4,
+        taskQueue: TaskQueue,
+        storage: SchedulerStorage,
+        taskRunner: TaskRunner = DefaultTaskRunner(),
+        heartbeatIntervalMs: Long = 2_000,
+        onTaskCompleted: (suspend (TaskInstance, TaskExecutionResult) -> Unit)? = null
+    ) : this(
+        workerId = workerId,
+        capacity = capacity,
+        taskQueue = taskQueue,
+        workerRegistry = storage,
+        runHistoryStore = storage,
+        taskRunner = taskRunner,
+        heartbeatIntervalMs = heartbeatIntervalMs,
+        onTaskCompleted = onTaskCompleted
+    )
     private val logger = LoggerFactory.getLogger("Worker-$workerId")
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val isRunning = AtomicBoolean(false)
@@ -59,7 +81,7 @@ class WorkerNode(
             status = WorkerStatus.HEALTHY,
             activeTaskIds = activeTasks.keys.toSet()
         )
-        storage.upsertWorker(info)
+        workerRegistry.upsertWorker(info)
     }
 
     private suspend fun workerLoop(slot: Int) {
@@ -92,7 +114,7 @@ class WorkerNode(
             lastHeartbeatEpochMs = System.currentTimeMillis()
         )
         activeTasks[runningTask.taskInstanceId] = runningTask
-        storage.saveTaskInstance(runningTask)
+        runHistoryStore?.saveTaskInstance(runningTask)
         logger.info("Worker '$workerId' picked up task '${runningTask.taskInstanceId}' (Attempt ${runningTask.attempt})")
 
         try {
@@ -116,7 +138,7 @@ class WorkerNode(
                     error = result.error
                 )
             }
-            storage.saveTaskInstance(completedTask)
+            runHistoryStore?.saveTaskInstance(completedTask)
 
             if (onTaskCompleted != null) {
                 onTaskCompleted.invoke(completedTask, result)
@@ -130,7 +152,7 @@ class WorkerNode(
                 completedAtEpochMs = System.currentTimeMillis(),
                 error = e.message
             )
-            storage.saveTaskInstance(failedTask)
+            runHistoryStore?.saveTaskInstance(failedTask)
         }
     }
 
@@ -145,7 +167,7 @@ class WorkerNode(
                 status = WorkerStatus.DEAD,
                 activeTaskIds = emptySet()
             )
-            storage.upsertWorker(deadInfo)
+            workerRegistry.upsertWorker(deadInfo)
             scope.cancel()
         }
     }

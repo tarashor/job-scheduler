@@ -11,11 +11,13 @@ fun main() = runBlocking {
     val coordinatorId = System.getenv("COORDINATOR_ID") ?: "coordinator-${UUID.randomUUID().toString().substring(0, 6)}"
     logger.info("Starting Scheduler Coordinator Microservice [$coordinatorId]...")
 
-    val bundle = StorageFactory.createFromEnv()
+    val bundle = StorageFactory.createCoordinatorStorageFromEnv()
     val coordinator = SchedulerCoordinator(
         coordinatorId = coordinatorId,
         leaseStore = bundle.leaseStore,
-        storage = bundle.storage,
+        jobMetadataStore = bundle.jobMetadataStore,
+        runHistoryStore = bundle.runHistoryStore,
+        workerRegistry = bundle.workerRegistry,
         taskQueue = bundle.taskQueue
     )
     coordinator.start()

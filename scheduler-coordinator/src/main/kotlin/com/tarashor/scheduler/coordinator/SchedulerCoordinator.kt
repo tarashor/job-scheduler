@@ -6,7 +6,11 @@ import com.tarashor.scheduler.core.cron.CronParser
 import com.tarashor.scheduler.core.dag.DAGEngine
 import com.tarashor.scheduler.core.model.*
 import com.tarashor.scheduler.queue.TaskQueue
+import com.tarashor.scheduler.storage.CompositeSchedulerStorage
+import com.tarashor.scheduler.storage.JobMetadataStore
+import com.tarashor.scheduler.storage.RunHistoryStore
 import com.tarashor.scheduler.storage.SchedulerStorage
+import com.tarashor.scheduler.storage.WorkerRegistry
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import java.util.UUID
@@ -15,13 +19,37 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class SchedulerCoordinator(
     val coordinatorId: String,
-    private val leaseStore: LeaseStore,
-    val storage: SchedulerStorage,
+    val leaseStore: LeaseStore,
+    val jobMetadataStore: JobMetadataStore,
+    val runHistoryStore: RunHistoryStore,
+    val workerRegistry: WorkerRegistry,
     val taskQueue: TaskQueue,
     private val tickIntervalMs: Long = 1_000,
     private val workerHeartbeatTimeoutMs: Long = 8_000,
     private val leaseDurationMs: Long = 6_000
 ) {
+    val storage: SchedulerStorage = CompositeSchedulerStorage(jobMetadataStore, runHistoryStore, workerRegistry)
+
+    // Backward-compatible constructor for composite/monolithic storage
+    constructor(
+        coordinatorId: String,
+        leaseStore: LeaseStore,
+        storage: SchedulerStorage,
+        taskQueue: TaskQueue,
+        tickIntervalMs: Long = 1_000,
+        workerHeartbeatTimeoutMs: Long = 8_000,
+        leaseDurationMs: Long = 6_000
+    ) : this(
+        coordinatorId = coordinatorId,
+        leaseStore = leaseStore,
+        jobMetadataStore = storage,
+        runHistoryStore = storage,
+        workerRegistry = storage,
+        taskQueue = taskQueue,
+        tickIntervalMs = tickIntervalMs,
+        workerHeartbeatTimeoutMs = workerHeartbeatTimeoutMs,
+        leaseDurationMs = leaseDurationMs
+    )
     private val logger = LoggerFactory.getLogger("Coordinator-$coordinatorId")
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val isRunning = AtomicBoolean(false)

@@ -12,12 +12,13 @@ fun main() = runBlocking {
     val capacity = System.getenv("WORKER_CAPACITY")?.toIntOrNull() ?: 4
     logger.info("Starting Worker Microservice Pod [$workerId] with capacity $capacity...")
 
-    val bundle = StorageFactory.createFromEnv()
+    val bundle = StorageFactory.createWorkerStorageFromEnv()
     val worker = WorkerNode(
         workerId = workerId,
         capacity = capacity,
         taskQueue = bundle.taskQueue,
-        storage = bundle.storage
+        workerRegistry = bundle.workerRegistry,
+        runHistoryStore = bundle.runHistoryStore
     )
     worker.start()
 

@@ -4,7 +4,11 @@ import com.tarashor.scheduler.cluster.LeaseStore
 import com.tarashor.scheduler.core.dag.DAGEngine
 import com.tarashor.scheduler.core.model.*
 import com.tarashor.scheduler.queue.TaskQueue
+import com.tarashor.scheduler.storage.CompositeSchedulerStorage
+import com.tarashor.scheduler.storage.JobMetadataStore
+import com.tarashor.scheduler.storage.RunHistoryStore
 import com.tarashor.scheduler.storage.SchedulerStorage
+import com.tarashor.scheduler.storage.WorkerRegistry
 import com.tarashor.scheduler.ui.DashboardHtml
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -45,10 +49,28 @@ data class EnrichedJobRun(
 
 class SchedulerApiServer(
     val port: Int,
-    val storage: SchedulerStorage,
+    val jobMetadataStore: JobMetadataStore,
+    val runHistoryStore: RunHistoryStore,
+    val workerRegistry: WorkerRegistry,
     val taskQueue: TaskQueue,
     val leaseStore: LeaseStore
 ) {
+    val storage: SchedulerStorage = CompositeSchedulerStorage(jobMetadataStore, runHistoryStore, workerRegistry)
+
+    // Backward-compatible constructor
+    constructor(
+        port: Int,
+        storage: SchedulerStorage,
+        taskQueue: TaskQueue,
+        leaseStore: LeaseStore
+    ) : this(
+        port = port,
+        jobMetadataStore = storage,
+        runHistoryStore = storage,
+        workerRegistry = storage,
+        taskQueue = taskQueue,
+        leaseStore = leaseStore
+    )
     private val logger = LoggerFactory.getLogger("SchedulerApiServer-$port")
     private var server: EmbeddedServer<*, *>? = null
 
