@@ -27,6 +27,7 @@
    - [Моніторинг воркерів, Heartbeats та рекламація завдань](#моніторинг-воркерів-heartbeats-та-рекламація-завдань)
    - [Експоненційне відтермінування з джитером (Exponential Backoff with Jitter) та черга DLQ](#експоненційне-відтермінування-з-джитером-exponential-backoff-with-jitter-та-черга-dlq)
    - [Детальне архітектурне обґрунтування: Чому обрано Redis замість Kafka](#детальне-архітектурне-обґрунтування-чому-обрано-redis-замість-kafka)
+   - [Канонічна архітектура «Database-per-Microservice» для High-Load (10k QPS)](#канонічна-архітектура-database-per-microservice-для-high-load-10k-qps)
 4. [Багатомодульна структура кодової бази](#4-багатомодульна-структура-кодової-бази)
 5. [Запуск мікросервісів](#5-запуск-мікросервісів)
    - [Варіант A: Docker Compose (Повний розподілений кластер)](#варіант-a-docker-compose-повний-розподілений-кластер)
@@ -307,6 +308,71 @@ flowchart TD
 - **Kafka на вході**: Поглинає величезні сплески вхідних подій з високою швидкістю.
 - **Redis у центрі**: Забезпечує роботу рушія завдань — перевірку умов DAG, похвилинну/посекундну точність через `ZSET` та арбітраж лідера.
 - **Kafka на виході**: Зберігає повний незмінний аудит усіх запусків для аналітики та довгострокового збереження.
+
+---
+
+### Канонічна архітектура «Database-per-Microservice» для High-Load (10k QPS)
+
+На етапі MVP або локальної розробки спільний Redis допустимий як уніфікований шар черг і координації. Проте у повноцінному Enterprise-середовищі з навантаженням **$10{,}000\text{ завдань/сек}$** це створює **Shared Database Anti-Pattern**, критичну єдину точку відмови (SPOF) та ризик блокування пам'яті (OOM).
+
+У канонічній системі застосовується патерн **Database-per-Microservice**, де кожен сервіс володіє ізольованим сховищем, оптимізованим під його специфічний патерн доступу (Access Pattern).
+
+#### Архітектурна топологія ізольованих сховищ
+
+```mermaid
+flowchart TD
+    subgraph ClientLayer ["Клієнти / Зовнішні бізнес-сервіси"]
+        Client["Клієнтські мікросервіси"]
+    end
+
+    Client -->|"HTTP POST /api/jobs"| API["1. scheduler-api"]
+
+    subgraph APIDomain ["Домен метаданих (scheduler-api)"]
+        API -->|"CRUD конфігурацій"| APIDB[("Persistent Metadata DB<br/>PostgreSQL / CockroachDB<br/>• Специфікації завдань (JobSpec)<br/>• Топологія DAG графів<br/>• Cron-розклади та політики")]
+        API -->|"Transactional Outbox"| OutboxTable["Таблиця outbox_events"]
+    end
+
+    OutboxTable -->|"CDC / Debezium"| EventBus[("Event Bus<br/>Apache Kafka / NATS")]
+
+    subgraph CoordDomain ["Домен черги та лідерства (scheduler-coordinator)"]
+        EventBus -->|"Event: JobScheduled"| Coord["2. scheduler-coordinator"]
+        Coord <-->|"Шардована черга затримок & Лізи"| RedisCluster[("Redis Cluster (In-Memory)<br/>• ZSET черги (64 шарди)<br/>• Лідерські лізи (SET NX PX)<br/>• Heartbeats активних воркерів")]
+    end
+
+    subgraph WorkerPoolDomain ["Домен виконання (scheduler-worker)"]
+        RedisCluster -->|"ZPOPMIN (Pull готових завдань)"| W1["Worker Pod Alpha<br/>(Stateless: БЕЗ БД)"]
+        RedisCluster -->|"ZPOPMIN (Pull готових завдань)"| W2["Worker Pod Beta<br/>(Stateless: БЕЗ БД)"]
+    end
+
+    W1 -.->|"HTTP POST / Webhook"| Target["Цільові мікросервіси"]
+    W2 -.->|"HTTP POST / Webhook"| Target
+
+    W1 -->|"Event: TaskExecuted"| EventBus
+    W2 -->|"Event: TaskExecuted"| EventBus
+
+    subgraph AuditDomain ["Домен історії та аналітики"]
+        EventBus --> HistorySvc["3. scheduler-history Consumer"]
+        HistorySvc --> AnalyticsDB[("Time-Series / Cold Storage<br/>ClickHouse / ScyllaDB / S3<br/>• 26 ТБ журналу запусків / 30 днів<br/>• Метрики SLA та затримок<br/>• Повні логи та трасування помилок")]
+    end
+
+    HistorySvc -.->|"Просування графа DAG"| Coord
+```
+
+#### Декомпозиція та моделі даних за мікросервісами:
+
+| Мікросервіс | Обране сховище даних | Модель та патерн доступу | Життєвий цикл даних |
+| :--- | :--- | :--- | :--- |
+| **`scheduler-api`** | **PostgreSQL** / **CockroachDB** | **ACID / Relational**: Збереження конфігурацій завдань (`JobSpec`), графів DAG (`dag_nodes`, `dag_edges`), Cron-розкладів, прав доступу (RBAC). Низький QPS, висока надійність. | Довгостроковий (роки), дискове збереження, регулярні бекапи. |
+| **`scheduler-coordinator`** | **Redis Cluster** (виділений) | **In-Memory Key-Value & SkipList**: Шардовані черги затримок (`ZSET`), лізингові блокування лідера (`SET NX PX`), heartbeat-хеші. Екстремальний QPS ($10\text{k} - 30\text{k}$ оп/сек), $O(\log N)$ затримки. | Тимчасовий (хвилини/години). Дані видаляються з черги відразу після забору воркером. |
+| **`scheduler-worker`** | **Stateless (БЕЗ власної БД)** | **No DB**: Воркери повністю позбавлені прямого доступу до баз даних. Отримують лише `TaskExecutionPayload` (URL, параметри, таймаут, `Idempotency-Key`) і публікують події статусу. | Відсутній (повна незалежність від сховищ). |
+| **`scheduler-history`** | **ClickHouse** / **ScyllaDB / S3** | **Append-Only Time-Series**: Журнал запусків `job_runs` та `task_executions`. Високошвидкісний паралельний запис ($10{,}000$ подій/сек), компресія у 5–10 разів, швидкі аналітичні агрегації по SLA. | Середньо- та довгостроковий (30 днів у гарячій БД $\approx 26\text{ ТБ}$, далі вивантаження в S3 Iceberg). |
+
+#### Міжсервісна синхронізація без спільної БД (Transactional Outbox)
+Щоб уникнути розподілених транзакцій (2PC), використовується патерн **Transactional Outbox**:
+1. `scheduler-api` зберігає завдання у PostgreSQL і в тій самій локальній транзакції пише подію в таблицю `outbox_events`.
+2. Фоновий ретранслятор (Debezium CDC або Transactional Log Miner) публікує подію `JobScheduledEvent` у Kafka/NATS.
+3. `scheduler-coordinator` отримує подію з шини та заштовхує інстанс завдання у відповідний шард черги Redis (`delay_queue:{shard}`).
+4. Після завершення воркер надсилає подію `TaskExecutedEvent`. Сервіс історії фіксує її в ClickHouse, а координатор оцінює готовність наступних кроків графа DAG.
 
 ---
 
