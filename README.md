@@ -91,62 +91,54 @@ flowchart TD
 
 ### Діаграма послідовності (Sequence Diagram)
 
-Діаграма демонструє наскрізний життєвий цикл: від реєстрації мульти-завдання клієнтським мікросервісом до лідерської координації, паралельного виконання воркерами через HTTP-вебхуки та оновлення статусу запуску.
+Діаграма демонструє наскрізний життєвий цикл атомарного завдання: від реєстрації клієнтським мікросервісом у PostgreSQL, гарантованого відправлення через Transactional Outbox у шардовану чергу Redis, до забору Stateless-воркером через Pull-backpressure, виконання HTTP/Shell-дії та оновлення статусу запуску.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Client as Клієнтський мікросервіс
-    participant API as scheduler-api (Шлюз)
-    participant Redis as Redis (Сховище, Черга & Лізи)
-    participant Coord as scheduler-coordinator (Лідер)
-    participant W1 as scheduler-worker (Alpha)
-    participant W2 as scheduler-worker (Beta)
-    participant Target as Цільовий мікросервіс (API)
+    participant API as scheduler-api (Stateless Шлюз)
+    participant PG as PostgreSQL (Metadata & Outbox)
+    participant Coord as scheduler-coordinator (Stateless / Leader)
+    participant Redis as Redis (Шардована черга & Лізи)
+    participant Worker as scheduler-worker (Stateless Pod)
+    participant Target as Цільовий мікросервіс (HTTP / Shell)
 
-    Note over Coord,Redis: Лідер періодично оновлює свій ліз (SET NX PX)
-    Coord->>Redis: Оновлення лідерського лізу з Fencing Token
-    Redis-->>Coord: Підтверджено (OK)
-
-    Note over Client,API: 1. Реєстрація та запуск завдання
-    Client->>API: POST /api/jobs (Опис джоби з незалежними завданнями)
-    API->>Redis: Збереження специфікації JobSpec
+    Note over Client,PG: 1. Реєстрація атомарного завдання
+    Client->>API: POST /api/jobs (Атомарний JobSpec: Cron / Immediate / OneOff)
+    API->>PG: INSERT INTO jobs (JobSpec з дією JobAction)
     API-->>Client: 201 Created
 
+    Note over Client,Redis: 2. Тригеринг та Transactional Outbox
     Client->>API: POST /api/jobs/{id}/trigger
-    API->>Redis: Створення JobRun (status=RUNNING)
-    API->>Redis: Прямий Enqueue усіх незалежних завдань у ZSET
+    API->>PG: BEGIN TRANSACTION: Створення JobRun + OutboxEvent
+    API->>PG: COMMIT
     API-->>Client: 202 Accepted (RunId згенеровано)
 
-    Note over Redis,W1: 2. Worker Alpha бере перше завдання (Pull)
-    W1->>Redis: Опитування черги: ZPOPMIN (score <= now)
-    Redis-->>W1: Task 1: "Списання оплати" (HTTP POST)
-    W1->>Redis: Оновлення статусу Task 1: RUNNING (Worker=Alpha)
+    Note over Coord,Redis: 3. Outbox Dispatcher або активний таймер
+    Coord->>PG: Опитування pending outbox подій
+    Coord->>Redis: Enqueue готового запуску в шардовану чергу ZSET
+    Coord->>PG: Оновлення OutboxEvent: DISPATCHED
 
-    par Виконання Task 1 та фоновий Heartbeat
-        W1->>Target: HTTP POST /v1/charge (з Idempotency-Key)
-        Target-->>W1: 200 OK (Оплату успішно проведено)
-    and Періодичний Heartbeat воркера Alpha
-        W1->>Redis: Heartbeat: load=1, activeTasks=[Task 1]
+    Note over Redis,Worker: 4. Worker забирає завдання (Pull з Backpressure)
+    Worker->>Redis: ZPOPMIN (score <= now)
+    Redis-->>Worker: Екземпляр JobRun (JobAction: HTTP / Shell)
+    Worker->>Redis: Оновлення статусу JobRun: RUNNING
+
+    par Виконання дії та фоновий Heartbeat
+        Worker->>Target: HTTP POST /v1/charge (з Idempotency-Key)
+        Target-->>Worker: 200 OK (Виконано успішно)
+    and Періодичний Heartbeat воркера
+        Worker->>Redis: Heartbeat: status=HEALTHY, activeTasks=[runId]
     end
 
-    W1->>Redis: Оновлення статусу Task 1: COMPLETED
+    Worker->>Redis: Оновлення JobRun: status=COMPLETED (з результатом JSON)
 
-    Note over Redis,W2: 3. Worker Beta паралельно забирає друге завдання
-    W2->>Redis: Опитування черги: ZPOPMIN
-    Redis-->>W2: Task 2: "Резервування товару" (HTTP POST)
-    W2->>Target: HTTP POST /v1/reserve
-    Target-->>W2: 200 OK (Товар зарезервовано)
-    W2->>Redis: Оновлення статусу Task 2: COMPLETED
-
-    Note over Coord,Redis: 4. Завершення всього запуску
-    Coord->>Redis: Усі завдання джоби завершено успішно
-    Coord->>Redis: Оновлення JobRun: status=COMPLETED
-    
+    Note over Client,API: 5. Отримання результату
     Client->>API: GET /api/runs/{runId}
-    API->>Redis: Читання стану запуску та завдань
-    Redis-->>API: JobRun COMPLETED з результатами
-    API-->>Client: 200 OK (Завдання успішно виконано)
+    API->>Redis: Читання стану JobRun
+    Redis-->>API: JobRun COMPLETED
+    API-->>Client: 200 OK (Результат виконання)
 ```
 
 ---
@@ -495,14 +487,18 @@ docker-compose up --build
 ```
 
 Ця команда розгортає:
-- **`scheduler-redis`**: Розподілений шар черги затримок (`ZSET`), лідерських блокувань (`SET NX PX`) та реєстру воркерів на порті `6379`.
-- **`scheduler-api-service`**: Spring Boot API-шлюз та Web UI на адресі `http://localhost:8080`, підключений до власної персистентної бази метаданих через том `metadata-storage` (`/app/data/api_metadata.db`).
-- **`scheduler-coordinator-primary`**: Основний активний координатор (Spring Boot лідер).
-- **`scheduler-coordinator-standby`**: Резервний координатор для автоматичного перехоплення лідерства (Spring Boot Failover).
-- **`scheduler-worker-alpha`**: Перший воркер-под (місткість: 4 завдання). **Повністю Stateless** (БЕЗ томів БД).
-- **`scheduler-worker-beta`**: Другий воркер-под (місткість: 4 завдання). **Повністю Stateless** (БЕЗ томів БД).
+- **`scheduler-postgres`**: Реляційна база даних PostgreSQL 16 на порті `5432` з персистентним томом `postgres-data` (збереження конфігурацій джоб та Transactional Outbox).
+- **`scheduler-redis`**: Шар шардованої черги затримок (`ZSET`), лізингових блокувань (`SET NX PX`) та реєстру воркерів на порті `6379`.
+- **`scheduler-api-service`**: Spring Boot API-шлюз та Web UI на адресі `http://localhost:8080`. **Повністю Stateless** (БЕЗ томів БД) — горизонтально масштабується однією командою:
+  ```bash
+  docker compose up --scale scheduler-api=3 -d
+  ```
+- **`scheduler-coordinator-primary`**: Координатор (Stateless Active-Active або лідер), що підключається до PostgreSQL через пул з'єднань HikariCP.
+- **`scheduler-coordinator-standby`**: Другий координатор кластера для паралельної обробки розкладів та миттєвого failover без простоїв.
+- **`scheduler-worker-alpha`**: Перший воркер-под (місткість: 4 паралельні дії). **Повністю Stateless** (БЕЗ доступу до БД).
+- **`scheduler-worker-beta`**: Другий воркер-под (місткість: 4 паралельні дії). **Повністю Stateless** (БЕЗ доступу до БД).
 
-Воркери взаємодіють суто через чергу повідомлень та публікацію статусів, що забезпечує необмежене горизонтальне масштабування без навантаження на пули з'єднань з базою даних.
+Всі мікросервіси (`api`, `coordinator`, `worker`) повністю позбавлені локального дискового стану та працюють як масштабовані хмарні контейнери.
 
 ---
 
@@ -533,8 +529,8 @@ WORKER_ID=worker-beta ./gradlew :scheduler-worker:bootRun
 Панель надає візуальний контроль у реальному часі:
 - **Топологія кластера**: Активний лідер, поточний Fencing Token, кількість зареєстрованих воркерів.
 - **Воркери**: Статус працездатності, місткість, поточне завантаження, затримка heartbeat.
-- **Визначені завдання**: Перелік завдань, cron-розклади та списки дій.
-- **Активні запуски**: Покроковий стан виконання завдань (`QUEUED` $\rightarrow$ `RUNNING` $\rightarrow$ `COMPLETED`).
+- **Визначені завдання**: Перелік атомарних завдань (`JobSpec`), cron-розклади та виконувані дії (`JobAction`).
+- **Активні запуски**: Стан виконання завдань (`QUEUED` $\rightarrow$ `RUNNING` $\rightarrow$ `COMPLETED`).
 - **Черга мертвих листів (DLQ)**: Перегляд помилок та кнопка **«Retry»** для повторного запуску.
 - **Симуляція аварії лідера**: Кнопка ручного складання повноважень лідера для спостереження за автоматичним перехопленням лідерства резервним координатором.
 
@@ -577,7 +573,7 @@ curl -X POST http://localhost:8080/api/jobs \
 
 #### 3. Ручний запуск завдання
 ```bash
-curl -X POST http://localhost:8080/api/jobs/order-fulfillment-job/trigger
+curl -X POST http://localhost:8080/api/jobs/charge-renewal-job/trigger
 ```
 
 #### 4. Запит прогресу виконання завдань
