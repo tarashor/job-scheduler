@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cloud Tasks & Distributed Job Scheduler Dashboard</title>
+    <title>Distributed Job Scheduler Dashboard (Redis + PostgreSQL)</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -84,9 +84,9 @@
     <div class="container">
         <header>
             <div>
-                <h1>☁️ Cloud Tasks & Distributed Scheduler</h1>
+                <h1>⚡ Distributed Job Scheduler</h1>
                 <p style="color: var(--text-secondary); font-size: 13px; margin-top: 4px;">
-                    Google Cloud Tasks Architecture • PostgreSQL Standalone Engine (<code>FOR UPDATE SKIP LOCKED</code>) • Push HTTP & Shell Dispatching
+                    Redis 7 Sharded ZSET Engine (16 Shards) • PostgreSQL 16 ACID Metadata & Outbox • Push HTTP & Shell Dispatching
                 </p>
             </div>
             <div style="display: flex; gap: 10px; align-items: center;">
@@ -98,7 +98,7 @@
 
         <div class="grid">
             <div class="card">
-                <h3>Cloud Queues</h3>
+                <h3>Active Queues</h3>
                 <div class="stat" style="color: var(--accent-blue);" id="statQueues">-</div>
             </div>
             <div class="card">
@@ -116,17 +116,17 @@
         </div>
 
         <div class="tabs">
-            <button class="tab-btn active" onclick="switchTab('cloud-tasks')">⚡ Google Cloud Tasks</button>
+            <button class="tab-btn active" onclick="switchTab('cloud-tasks')">⚡ Queues & Delayed Tasks</button>
             <button class="tab-btn" onclick="switchTab('jobs')">📅 Cron & Batch Jobs</button>
             <button class="tab-btn" onclick="switchTab('cluster')">🖥️ Cluster & DLQ</button>
         </div>
 
         <!-- ============================================================== -->
-        <!-- TAB 1: GOOGLE CLOUD TASKS -->
+        <!-- TAB 1: TASK QUEUES -->
         <!-- ============================================================== -->
         <div id="tab-cloud-tasks" class="tab-content active">
             <div class="section-header">
-                <h2>Cloud Tasks Queues</h2>
+                <h2>Task Queues (Rate Limiting & Concurrency)</h2>
                 <div style="display: flex; gap: 8px;">
                     <button onclick="openCreateTaskModal()" class="btn-success">+ Enqueue Task</button>
                     <button onclick="sendQuickTestTask()" class="btn-sm btn-secondary">⚡ Quick Test Task</button>
@@ -152,7 +152,7 @@
             </div>
 
             <div class="section-header">
-                <h2>Cloud Tasks</h2>
+                <h2>Tasks & Delayed Executions</h2>
                 <div style="display: flex; gap: 8px; align-items: center;">
                     <label style="font-size: 12px; color: var(--text-secondary);">Queue:</label>
                     <select id="queueFilterSelect" onchange="filterTasks()" class="form-control" style="width: auto; padding: 4px 8px; font-size: 12px;">

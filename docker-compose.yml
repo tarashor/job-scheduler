@@ -2,8 +2,21 @@ version: '3.8'
 
 services:
   # -------------------------------------------------------------
-  # Relational Database: PostgreSQL 16 (Standalone Single Source of Truth)
-  # Powers TaskQueue (FOR UPDATE SKIP LOCKED), Cluster Leases, Queues & Tasks
+  # Shared Coordination & Distributed Task Queue: Redis 7
+  # -------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: scheduler-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+
+  # -------------------------------------------------------------
+  # Relational Database: PostgreSQL 16 (Stateless API & Coordinator Metadata)
   # -------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
@@ -32,6 +45,8 @@ services:
       target: api
     container_name: scheduler-api-service
     environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=scheduler
@@ -41,11 +56,13 @@ services:
     ports:
       - "8080:8080"
     depends_on:
+      redis:
+        condition: service_healthy
       postgres:
         condition: service_healthy
 
   # -------------------------------------------------------------
-  # Microservice 2: Active Coordinator (Stateless Node 1)
+  # Microservice 2: Active Master Coordinator (Stateless Node 1)
   # -------------------------------------------------------------
   scheduler-coordinator-1:
     build:
@@ -54,6 +71,8 @@ services:
       target: coordinator
     container_name: scheduler-coordinator-primary
     environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=scheduler
@@ -61,6 +80,8 @@ services:
       - POSTGRES_PASSWORD=scheduler_secret
       - COORDINATOR_ID=coordinator-primary
     depends_on:
+      redis:
+        condition: service_healthy
       postgres:
         condition: service_healthy
 
@@ -74,6 +95,8 @@ services:
       target: coordinator
     container_name: scheduler-coordinator-standby
     environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=scheduler
@@ -81,11 +104,13 @@ services:
       - POSTGRES_PASSWORD=scheduler_secret
       - COORDINATOR_ID=coordinator-standby
     depends_on:
+      redis:
+        condition: service_healthy
       postgres:
         condition: service_healthy
 
   # -------------------------------------------------------------
-  # Microservice 3: Worker Daemon Pod 1 (Stateless)
+  # Microservice 3: Worker Daemon Pod 1 (Stateless: No DB Volume)
   # -------------------------------------------------------------
   scheduler-worker-1:
     build:
@@ -94,19 +119,16 @@ services:
       target: worker
     container_name: scheduler-worker-alpha
     environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=scheduler
-      - POSTGRES_USER=scheduler
-      - POSTGRES_PASSWORD=scheduler_secret
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - WORKER_ID=worker-alpha
       - WORKER_CAPACITY=4
     depends_on:
-      postgres:
+      redis:
         condition: service_healthy
 
   # -------------------------------------------------------------
-  # Microservice 3b: Worker Daemon Pod 2 (Stateless)
+  # Microservice 3b: Worker Daemon Pod 2 (Stateless: No DB Volume)
   # -------------------------------------------------------------
   scheduler-worker-2:
     build:
@@ -115,18 +137,13 @@ services:
       target: worker
     container_name: scheduler-worker-beta
     environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=scheduler
-      - POSTGRES_USER=scheduler
-      - POSTGRES_PASSWORD=scheduler_secret
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - WORKER_ID=worker-beta
       - WORKER_CAPACITY=4
     depends_on:
-      postgres:
+      redis:
         condition: service_healthy
 
 volumes:
   postgres-data:
-
-
