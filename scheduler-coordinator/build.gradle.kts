@@ -6,7 +6,6 @@ plugins {
 
 dependencies {
     implementation(project(":scheduler-common"))
-    implementation(project(":scheduler-storage"))
     implementation("org.springframework.boot:spring-boot-starter")
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation(project(":scheduler-worker"))

@@ -155,11 +155,10 @@ sequenceDiagram
 
 | Мікросервіс | Модуль коду | Власна база даних | Стратегія масштабування | Основна відповідальність |
 | :--- | :--- | :--- | :--- | :--- |
-| **`scheduler-api`** | `scheduler-api` | **`JobMetadataStore`** (SQLite / PostgreSQL) | Stateless ($N$ реплік за Ingress) | Вхідний REST API, збереження специфікацій завдань, запит статусу запусків, вбудований Web Dashboard. |
-| **`scheduler-coordinator`** | `scheduler-coordinator` | **`TaskQueue` + `LeaseStore`** (Redis Cluster) | Active-Standby ($2$–$3$ репліки) | Годинник розкладу, подовження лідерського лізу з Fencing Token, диспетчеризація завдань, Reaper завислих воркерів. |
+| **`scheduler-api`** | `scheduler-api` | **`JobMetadataStore`** (PostgreSQL / SQLite) | Stateless ($N$ реплік за Ingress) | Вхідний REST API, збереження специфікацій завдань, запит статусу запусків, вбудований Web Dashboard. |
+| **`scheduler-coordinator`** | `scheduler-coordinator` | **`TaskQueue` + `LeaseStore`** (Redis Cluster) | Active-Active / Standby | Годинник розкладу, лідерський ліз (`LeaderElector`), Transactional Outbox диспетчеризація, Reaper завислих воркерів. |
 | **`scheduler-worker`** | `scheduler-worker` | **Stateless (БЕЗ БД)** | Горизонтальне HPA ($N$ подів) | Повністю без збереження стану. Витягує завдання з черги, виконує HTTP-вебхуки/скрипти, надсилає heartbeats у `WorkerRegistry`. |
-| **`scheduler-storage`** | `scheduler-storage` | Доменні модулі сховищ | Спільна бібліотека | Ізольовані контракти `JobMetadataStore`, `RunHistoryStore`, `WorkerRegistry`, `CompositeSchedulerStorage`, підтримка SQLite та Redis. |
-| **`scheduler-common`** | `scheduler-common` | — | Спільна бібліотека | Доменні моделі даних, парсер 5-значних Cron-виразів. |
+| **`scheduler-common`** | `scheduler-common` | — | Спільна бібліотека | Чисті доменні моделі, порти сховищ (`JobMetadataStore`, `RunHistoryStore`, `WorkerRegistry`, `OutboxStore`), черги `TaskQueue`, адаптери SQLite, PostgreSQL, Redis. |
 
 ---
 
@@ -425,50 +424,55 @@ $$\text{shardIndex} = |\text{hash}(\text{taskInstanceId})| \pmod{16}$$
 
 ```
 job-scheduler/
-├── scheduler-common/                     # [1. Domain Layer: чисті бізнес-сутності без залежностей]
-│   └── src/main/kotlin/com/tarashor/scheduler/core/
-│       ├── model/Models.kt               # Pure Domain Entities: JobSpec, JobExecution, JobRun, JobAction
-│       └── cron/CronParser.kt            # Парсер 5-значних Cron-виразів
-├── scheduler-storage/                    # [2. Data Layer: Ports & Adapters (Database-per-Microservice)]
+├── scheduler-common/                     # [1. Domain & Shared Adapters Layer]
 │   ├── src/main/kotlin/com/tarashor/scheduler/
-│   │   ├── service/JobTriggerService.kt  # Use Case: Атомарний запуск джоби та Transactional Outbox
-│   │   ├── storage/JobMetadataStore.kt   # ISP Port: Метадані завдань (API-домен)
-│   │   ├── storage/RunHistoryStore.kt    # ISP Port: Історія запусків та аудиту
-│   │   ├── storage/WorkerRegistry.kt     # ISP Port: Реєстр воркерів та heartbeats
-│   │   ├── storage/OutboxStore.kt        # ISP Port: Транзакційний Outbox
-│   │   ├── storage/CompositeSchedulerStorage.kt # Делегат для мікросервісних портів
-│   │   ├── storage/InMemoryStores.kt     # InMemory-адаптери (SRP: винесено в окремий модуль)
-│   │   ├── storage/SqliteStores.kt       # SQLite-адаптери (SRP: винесено в окремий модуль)
-│   │   ├── storage/RedisStorage.kt       # Шардована черга Redis ZSET, лізи та distributed locks
-│   │   ├── cluster/LeaderElection.kt     # DistributedLockStore & LeaseStore
-│   │   └── queue/TaskQueue.kt            # 16-шардова черга з Round-Robin вибіркою
+│   │   ├── core/model/Models.kt          # Pure Domain Entities: JobSpec, JobRun, JobAction
+│   │   ├── core/cron/CronParser.kt       # Парсер 5-значних Cron-виразів
+│   │   ├── cluster/LeaseStore.kt         # ISP Ports: DistributedLockStore & LeaseStore
+│   │   ├── queue/TaskQueue.kt            # ISP Port: TaskQueue, InMemoryTaskQueue, ShardedTaskQueue
+│   │   ├── service/JobTriggerService.kt  # Use Case: Інтерфейс запуску джоби та outbox
+│   │   └── storage/                      # Domain Ports & Persistence Adapters:
+│   │       ├── JobMetadataStore.kt       # ISP Port: Метадані завдань (API-домен)
+│   │       ├── RunHistoryStore.kt        # ISP Port: Історія запусків та аудиту
+│   │       ├── WorkerRegistry.kt         # ISP Port: Реєстр воркерів та heartbeats
+│   │       ├── OutboxStore.kt            # ISP Port: Транзакційний Outbox
+│   │       ├── CompositeSchedulerStorage.kt
+│   │       ├── InMemoryStores.kt         # In-Memory адаптери для швидких тестів
+│   │       ├── PostgresStores.kt         # PostgreSQL адаптери з пулом HikariCP
+│   │       ├── SqliteStores.kt           # SQLite адаптери
+│   │       ├── RedisStorage.kt           # Шардована черга Redis ZSET, лізи та distributed locks
+│   │       └── StorageFactory.kt         # Фабрика сховищ для мікросервісів
 │   └── src/test/kotlin/com/tarashor/scheduler/
-│       ├── DatabasePerMicroserviceTest.kt # Тести ізоляції доменних БД
-│       ├── LeaderElectionTest.kt         # Тести лізингу та Fencing Tokens
 │       ├── ShardedTaskQueueTest.kt       # Тести 16-шардового розподілу
 │       ├── TaskQueueAndDLQTest.kt        # Тести черги затримок та DLQ
-│       └── TransactionalOutboxTest.kt    # Тести Zero-Loss відновлення
-├── scheduler-coordinator/                # [3. Application Services & Stateless Coordinator]
-│   ├── src/main/kotlin/com/tarashor/scheduler/coordinator/
-│   │   ├── service/JobSchedulingService.kt        # Use Case: Stateless Active-Active планування
-│   │   ├── service/WorkerReconciliationService.kt # Use Case: Reaper завислих воркерів
-│   │   ├── service/JobExecutionService.kt         # Use Case: Обробка результатів виконання
-│   │   ├── CoordinatorApplication.kt     # Spring Boot точка входу
-│   │   ├── CoordinatorConfig.kt          # Spring IoC Configuration
-│   │   ├── CoordinatorService.kt         # Spring Lifecycle Manager
-│   │   └── SchedulerCoordinator.kt       # Оркестратор сервісів (SRP-композиція)
+│       └── PostgresStoresTest.kt         # Тести PostgreSQL сховищ
+├── scheduler-coordinator/                # [2. Application Services & Stateless Coordinator]
+│   ├── src/main/kotlin/com/tarashor/scheduler/
+│   │   ├── coordinator/cluster/LeaderElector.kt   # Кластерне лідерство (Leader Election)
+│   │   ├── coordinator/outbox/TransactionalOutboxDispatcher.kt # Гарантований фоновий Outbox Dispatcher
+│   │   ├── coordinator/service/JobSchedulingService.kt        # Use Case: Stateless Active-Active планування
+│   │   ├── coordinator/service/WorkerReconciliationService.kt # Use Case: Reaper завислих воркерів
+│   │   ├── coordinator/service/JobExecutionService.kt         # Use Case: Обробка результатів виконання
+│   │   ├── coordinator/CoordinatorApplication.kt # Spring Boot точка входу
+│   │   ├── coordinator/CoordinatorConfig.kt      # Spring IoC Configuration
+│   │   ├── coordinator/CoordinatorService.kt     # Spring Lifecycle Manager
+│   │   └── coordinator/SchedulerCoordinator.kt   # Оркестратор сервісів (SRP-композиція)
 │   └── src/test/kotlin/com/tarashor/scheduler/
 │       ├── StatelessCoordinatorTest.kt   # Тести Active-Active Stateless координаторів без дублювань
+│       ├── LeaderElectionTest.kt         # Тести лізингу та Fencing Tokens
+│       ├── TransactionalOutboxTest.kt    # Тести Zero-Loss відновлення
 │       └── EndToEndSchedulerTest.kt      # Наскрізні E2E тести з decoupled сховищами
-├── scheduler-api/                        # [4. Interface Adapters: REST API & Web Dashboard]
-│   └── src/main/kotlin/com/tarashor/scheduler/
-│       ├── api/dto/ApiDtos.kt            # Request/Response Data Transfer Objects
-│       ├── api/ApiApplication.kt         # Spring Boot (@SpringBootApplication)
-│       ├── api/ApiController.kt          # Stateless REST Controller (делегує до JobTriggerService)
-│       ├── api/ApiConfig.kt              # Spring Web MVC, CORS & Bean IoC
-│       ├── api/DashboardController.kt    # Spring Controller для UI панелі
-│       └── ui/DashboardHtml.kt           # Вбудована односторінкова веб-панель
-└── scheduler-worker/                     # [5. Stateless Compute Engine: Workers]
+├── scheduler-api/                        # [3. Interface Adapters: REST API & Web Dashboard]
+│   ├── src/main/kotlin/com/tarashor/scheduler/
+│   │   ├── api/dto/ApiDtos.kt            # Request/Response Data Transfer Objects
+│   │   ├── api/ApiApplication.kt         # Spring Boot (@SpringBootApplication)
+│   │   ├── api/ApiController.kt          # Stateless REST Controller (делегує до JobTriggerService)
+│   │   ├── api/ApiConfig.kt              # Spring Web MVC, CORS & Bean IoC
+│   │   ├── api/DashboardController.kt    # Spring Controller для UI панелі
+│   │   └── ui/DashboardHtml.kt           # Вбудована односторінкова веб-панель
+│   └── src/test/kotlin/com/tarashor/scheduler/api/
+│       └── DatabasePerMicroserviceTest.kt # Тести ізоляції доменних БД
+└── scheduler-worker/                     # [4. Stateless Compute Engine: Workers]
     ├── src/main/kotlin/com/tarashor/scheduler/worker/
     │   ├── WorkerApplication.kt          # Spring Boot (@SpringBootApplication)
     │   ├── WorkerConfig.kt               # Spring IoC Configuration
@@ -597,9 +601,9 @@ curl -X POST http://localhost:8080/api/cluster/stepdown
 
 | Субпроєкт | Що перевіряється тестами |
 | :--- | :--- |
-| **`scheduler-common`** | Парсинг Cron-виразів, кроки (`*/5`), діапазони (`1-5`), пресети (`@daily`), валідація та серіалізація моделей завдань. |
-| **`scheduler-storage`** | **Ізоляція Database-per-Microservice** (`DatabasePerMicroserviceTest`): перевірка окремих схем БД без перетину таблиць (`jobs`, `job_runs`, `workers`). Атомарне лідерство (`LeaderElectionTest`), черги затримок Redis `ZSET`, backoff-джитер та DLQ (`TaskQueueAndDLQTest`). **Шардована черга** (`ShardedTaskQueueTest`): 16-шардовий розподіл навантаження та Round-Robin вибірка. **Транзакційний Outbox** (`TransactionalOutboxTest`): надійне збереження в SQLite/Memory та фонова диспетчеризація без втрати повідомлень. |
-| **`scheduler-coordinator`** | **Декомпонована оркестрація** (`EndToEndSchedulerTest`): наскрізний запуск незалежних завдань зі Stateless-воркером (без доступу до метаданих БД), автоматичний Reaper для аварійних воркерів та перехоплення лідерства. |
+| **`scheduler-common`** | Парсинг Cron-виразів (`CronParserTest`), черги затримок та DLQ (`TaskQueueAndDLQTest`), 16-шардова черга (`ShardedTaskQueueTest`), PostgreSQL та SQLite сховища з пулом HikariCP (`PostgresStoresTest`). |
+| **`scheduler-api`** | **Ізоляція Database-per-Microservice** (`DatabasePerMicroserviceTest`): перевірка окремих схем БД без перетину таблиць (`jobs`, `job_runs`, `workers`), валідація REST ендпоінтів та DTO контрактів. |
+| **`scheduler-coordinator`** | **Stateless Active-Active координація** (`StatelessCoordinatorTest`): паралельна робота 3 активних координаторів без дублювань. Атомарне лідерство (`LeaderElectionTest`), транзакційний Outbox Dispatcher (`TransactionalOutboxTest`), наскрізний E2E кластер (`EndToEndSchedulerTest`). |
 | **`scheduler-worker`** | **George Varghese & Anthony Lauck Hashed Timing Wheel** (`HashedTimingWheelTest`): мікросекундна точність виконання ($< 50\text{мс}$ проти ліміту SLA $2000\text{мс}$), коректність обробки багатообертових затримок (`roundsRemaining`) та миттєве виконання нульових затримок. |
 
 ---

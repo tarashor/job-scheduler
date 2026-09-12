@@ -4,7 +4,6 @@ plugins {
 rootProject.name = "job-scheduler"
 
 include("scheduler-common")
-include("scheduler-storage")
 include("scheduler-coordinator")
 include("scheduler-worker")
 include("scheduler-api")
