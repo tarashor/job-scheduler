@@ -227,4 +227,74 @@ class EndToEndSchedulerTest {
         statelessWorker.stop()
         coordinator.stop()
     }
+
+    @Test
+    fun `test declarative scheduling for OneOff future time and Immediate without manual trigger`() = runBlocking {
+        val storage = InMemorySchedulerStorage()
+        val leaseStore = InMemoryLeaseStore()
+        val taskQueue = InMemoryTaskQueue()
+
+        val coordinator = SchedulerCoordinator(
+            coordinatorId = "coord-declarative",
+            leaseStore = leaseStore,
+            storage = storage,
+            taskQueue = taskQueue,
+            tickIntervalMs = 100
+        )
+        coordinator.start()
+        for (i in 1..20) {
+            if (coordinator.isLeader()) break
+            delay(50)
+        }
+
+        // 1. OneOff future job: scheduled for 30 minutes in the future (no manual trigger!)
+        val futureTime = System.currentTimeMillis() + 1_800_000L
+        val oneOffJob = JobSpec(
+            jobId = "future-renewal-job",
+            name = "Renewal in 30 minutes",
+            schedule = ScheduleSpec.OneOff(futureTime),
+            tasks = listOf(
+                TaskSpec("charge-step", "Charge Renewal", action = TaskAction.Shell("echo charged"))
+            )
+        )
+        storage.saveJob(oneOffJob)
+
+        // Wait for coordinator tick to auto-process declarative schedule
+        var futureTaskQueued = false
+        for (i in 1..30) {
+            val instances = storage.findActiveTaskInstances().filter { it.jobId == "future-renewal-job" }
+            if (instances.isNotEmpty()) {
+                val task = instances.first()
+                assertEquals(futureTime, task.scheduledAtEpochMs)
+                futureTaskQueued = true
+                break
+            }
+            delay(100)
+        }
+        assertTrue(futureTaskQueued, "OneOff job should be automatically enqueued with future scheduledAtEpochMs")
+
+        // 2. Immediate job: executed right away (no manual trigger!)
+        val immediateJob = JobSpec(
+            jobId = "immediate-signup-job",
+            name = "Immediate Signup Charge",
+            schedule = ScheduleSpec.Immediate,
+            tasks = listOf(
+                TaskSpec("signup-charge", "Charge Signup", action = TaskAction.Shell("echo signup-ok"))
+            )
+        )
+        storage.saveJob(immediateJob)
+
+        var immediateTaskQueued = false
+        for (i in 1..30) {
+            val instances = storage.findActiveTaskInstances().filter { it.jobId == "immediate-signup-job" }
+            if (instances.isNotEmpty()) {
+                immediateTaskQueued = true
+                break
+            }
+            delay(100)
+        }
+        assertTrue(immediateTaskQueued, "Immediate job should be automatically enqueued right away")
+
+        coordinator.stop()
+    }
 }

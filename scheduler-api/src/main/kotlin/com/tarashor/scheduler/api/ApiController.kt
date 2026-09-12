@@ -187,20 +187,29 @@ class ApiController(
         ResponseEntity.status(HttpStatus.CREATED).body(run)
     }
 
-    suspend fun triggerJob(jobId: String, triggerSource: String = "MANUAL"): JobRun {
+    suspend fun triggerJob(
+        jobId: String,
+        triggerSource: String = "MANUAL",
+        scheduledTimeEpochMs: Long? = null
+    ): JobRun {
         val job = storage.getJob(jobId) ?: throw IllegalArgumentException("Job '$jobId' not found")
         val runId = UUID.randomUUID().toString()
         val now = System.currentTimeMillis()
         val fencingToken = leaseStore.getCurrentLease()?.fencingToken ?: 1L
 
-        logger.info("Triggering job '$jobId' (RunId: $runId, Source: $triggerSource, FencingToken: $fencingToken)")
+        val scheduledAt = scheduledTimeEpochMs ?: when (val s = job.schedule) {
+            is ScheduleSpec.OneOff -> s.timestampEpochMs
+            else -> now
+        }
+
+        logger.info("Triggering job '$jobId' (RunId: $runId, Source: $triggerSource, ScheduledAt: $scheduledAt, FencingToken: $fencingToken)")
 
         val run = JobRun(
             runId = runId,
             jobId = jobId,
             status = JobStatus.RUNNING,
             triggeredAtEpochMs = now,
-            startedAtEpochMs = now,
+            startedAtEpochMs = if (scheduledAt <= now) now else null,
             triggerSource = triggerSource
         )
         storage.saveRun(run)
@@ -215,7 +224,7 @@ class ApiController(
                 attempt = 1,
                 maxRetries = taskSpec.maxRetries,
                 action = taskSpec.action,
-                scheduledAtEpochMs = now,
+                scheduledAtEpochMs = scheduledAt,
                 fencingToken = fencingToken
             )
             val outboxEvent = OutboxEvent(

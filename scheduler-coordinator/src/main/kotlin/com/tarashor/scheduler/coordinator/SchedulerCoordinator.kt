@@ -129,11 +129,10 @@ class SchedulerCoordinator(
                     storage.saveJob(job.copy(enabled = false))
                 }
                 is ScheduleSpec.OneOff -> {
-                    if (now >= sched.timestampEpochMs) {
-                        triggerJob(job.jobId, triggerSource = "ONE_OFF")
-                        // Disable one-off job after trigger
-                        storage.saveJob(job.copy(enabled = false))
-                    }
+                    // Enqueue to sharded delayed queue immediately with target scheduled timestamp
+                    triggerJob(job.jobId, triggerSource = "ONE_OFF", scheduledTimeEpochMs = sched.timestampEpochMs)
+                    // Disable one-off job after enqueuing into delayed queue
+                    storage.saveJob(job.copy(enabled = false))
                 }
                 is ScheduleSpec.Cron -> {
                     val nextRun = nextCronRuns.computeIfAbsent(job.jobId) {
@@ -156,20 +155,29 @@ class SchedulerCoordinator(
         }
     }
 
-    suspend fun triggerJob(jobId: String, triggerSource: String = "MANUAL"): JobRun {
+    suspend fun triggerJob(
+        jobId: String,
+        triggerSource: String = "MANUAL",
+        scheduledTimeEpochMs: Long? = null
+    ): JobRun {
         val job = storage.getJob(jobId) ?: throw IllegalArgumentException("Job '$jobId' not found")
         val runId = UUID.randomUUID().toString()
         val now = System.currentTimeMillis()
         val fencingToken = getActiveFencingToken()
 
-        logger.info("Triggering job '$jobId' (RunId: $runId, Source: $triggerSource, FencingToken: $fencingToken)")
+        val scheduledAt = scheduledTimeEpochMs ?: when (val s = job.schedule) {
+            is ScheduleSpec.OneOff -> s.timestampEpochMs
+            else -> now
+        }
+
+        logger.info("Triggering job '$jobId' (RunId: $runId, Source: $triggerSource, ScheduledAt: $scheduledAt, FencingToken: $fencingToken)")
 
         val run = JobRun(
             runId = runId,
             jobId = jobId,
             status = JobStatus.RUNNING,
             triggeredAtEpochMs = now,
-            startedAtEpochMs = now,
+            startedAtEpochMs = if (scheduledAt <= now) now else null,
             triggerSource = triggerSource
         )
         storage.saveRun(run)
@@ -185,7 +193,7 @@ class SchedulerCoordinator(
                 attempt = 1,
                 maxRetries = taskSpec.maxRetries,
                 action = taskSpec.action,
-                scheduledAtEpochMs = now,
+                scheduledAtEpochMs = scheduledAt,
                 fencingToken = fencingToken
             )
             val outboxEvent = OutboxEvent(
