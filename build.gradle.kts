@@ -17,7 +17,7 @@ subprojects {
     apply(plugin = "org.jetbrains.kotlin.plugin.serialization")
 
     extensions.configure<org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension> {
-        jvmToolchain(26)
+        jvmToolchain(25)
     }
 
     dependencies {
