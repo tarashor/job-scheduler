@@ -16,7 +16,27 @@ services:
       retries: 5
 
   # -------------------------------------------------------------
-  # Microservice 1: REST API Gateway & Web Dashboard
+  # Relational Database: PostgreSQL 16 (Stateless API & Coordinator DB)
+  # -------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: scheduler-postgres
+    environment:
+      - POSTGRES_DB=scheduler
+      - POSTGRES_USER=scheduler
+      - POSTGRES_PASSWORD=scheduler_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+
+  # -------------------------------------------------------------
+  # Microservice 1: REST API Gateway & Web Dashboard (Stateless)
   # -------------------------------------------------------------
   scheduler-api:
     build:
@@ -27,18 +47,22 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - METADATA_SQLITE_PATH=/app/data/api_metadata.db
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=scheduler
+      - POSTGRES_USER=scheduler
+      - POSTGRES_PASSWORD=scheduler_secret
       - PORT=8080
-    volumes:
-      - metadata-storage:/app/data
     ports:
       - "8080:8080"
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
 
   # -------------------------------------------------------------
-  # Microservice 2: Active Master Coordinator (Leader)
+  # Microservice 2: Active Master Coordinator (Stateless Node 1)
   # -------------------------------------------------------------
   scheduler-coordinator-1:
     build:
@@ -49,16 +73,20 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - METADATA_SQLITE_PATH=/app/data/api_metadata.db
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=scheduler
+      - POSTGRES_USER=scheduler
+      - POSTGRES_PASSWORD=scheduler_secret
       - COORDINATOR_ID=coordinator-primary
-    volumes:
-      - metadata-storage:/app/data
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
 
   # -------------------------------------------------------------
-  # Microservice 2b: Standby Coordinator (Automated Failover)
+  # Microservice 2b: Active Coordinator (Stateless Peer Node 2)
   # -------------------------------------------------------------
   scheduler-coordinator-2:
     build:
@@ -69,12 +97,16 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - METADATA_SQLITE_PATH=/app/data/api_metadata.db
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=scheduler
+      - POSTGRES_USER=scheduler
+      - POSTGRES_PASSWORD=scheduler_secret
       - COORDINATOR_ID=coordinator-standby
-    volumes:
-      - metadata-storage:/app/data
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   # -------------------------------------------------------------
@@ -114,5 +146,5 @@ services:
         condition: service_healthy
 
 volumes:
-  metadata-storage:
+  postgres-data:
 

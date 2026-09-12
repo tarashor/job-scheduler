@@ -23,16 +23,56 @@ data class StorageBundle(
 object StorageFactory {
     private val logger = LoggerFactory.getLogger(StorageFactory::class.java)
 
+    fun getPostgresJdbcUrl(): String? {
+        val direct = System.getenv("POSTGRES_JDBC_URL") ?: System.getenv("POSTGRES_URL")
+        if (!direct.isNullOrBlank()) return direct
+        val host = System.getenv("POSTGRES_HOST")
+        if (!host.isNullOrBlank()) {
+            val port = System.getenv("POSTGRES_PORT") ?: "5432"
+            val db = System.getenv("POSTGRES_DB") ?: "scheduler"
+            return "jdbc:postgresql://$host:$port/$db"
+        }
+        return null
+    }
+
     /**
      * Creates storage tailored for the scheduler-api microservice.
-     * Supports isolated persistent metadata DB (e.g. SQLite/PostgreSQL) for Job Specs,
+     * Supports isolated persistent metadata DB (PostgreSQL / SQLite) for Job Specs,
      * while delegating task queue and leases to Redis/In-Memory.
      */
     fun createApiStorageFromEnv(): StorageBundle {
+        val baseBundle = createFromEnv()
+        val pgUrl = getPostgresJdbcUrl()
+
+        if (!pgUrl.isNullOrBlank()) {
+            val pgUser = System.getenv("POSTGRES_USER") ?: "postgres"
+            val pgPass = System.getenv("POSTGRES_PASSWORD") ?: "postgres"
+            val maxPool = System.getenv("POSTGRES_MAX_POOL_SIZE")?.toIntOrNull() ?: 15
+            logger.info("Database-per-Microservice: Using scalable PostgreSQL JobMetadataStore at $pgUrl (poolSize=$maxPool)")
+
+            val ds = PostgresDataSourceFactory.createDataSource(pgUrl, pgUser, pgPass, maxPoolSize = maxPool, poolName = "ApiPostgresPool")
+            val jobStore = PostgresJobMetadataStore(ds)
+            val runStore = PostgresRunHistoryStore(ds)
+            val outboxStore = PostgresOutboxStore(ds)
+
+            val composite = CompositeSchedulerStorage(
+                jobMetadataStore = jobStore,
+                runHistoryStore = runStore,
+                workerRegistry = baseBundle.workerRegistry
+            )
+            return StorageBundle(
+                storage = composite,
+                leaseStore = baseBundle.leaseStore,
+                taskQueue = baseBundle.taskQueue,
+                jobMetadataStore = jobStore,
+                runHistoryStore = runStore,
+                workerRegistry = baseBundle.workerRegistry,
+                outboxStore = outboxStore
+            )
+        }
+
         val metadataDbPath = System.getenv("METADATA_SQLITE_PATH")
             ?: System.getenv("METADATA_DB_PATH")
-
-        val baseBundle = createFromEnv()
 
         if (!metadataDbPath.isNullOrBlank()) {
             logger.info("Database-per-Microservice: Using dedicated SQLite JobMetadataStore at $metadataDbPath")
@@ -67,13 +107,41 @@ object StorageFactory {
      * Creates storage tailored for the scheduler-coordinator microservice.
      */
     fun createCoordinatorStorageFromEnv(): StorageBundle {
+        val baseBundle = createFromEnv()
+        val pgUrl = getPostgresJdbcUrl()
+
+        if (!pgUrl.isNullOrBlank()) {
+            val pgUser = System.getenv("POSTGRES_USER") ?: "postgres"
+            val pgPass = System.getenv("POSTGRES_PASSWORD") ?: "postgres"
+            val maxPool = System.getenv("POSTGRES_MAX_POOL_SIZE")?.toIntOrNull() ?: 10
+            logger.info("Coordinator: Attaching scalable PostgreSQL JobMetadataStore at $pgUrl")
+
+            val ds = PostgresDataSourceFactory.createDataSource(pgUrl, pgUser, pgPass, maxPoolSize = maxPool, poolName = "CoordinatorPostgresPool")
+            val jobStore = PostgresJobMetadataStore(ds)
+            val runStore = PostgresRunHistoryStore(ds)
+            val outboxStore = PostgresOutboxStore(ds)
+
+            val composite = CompositeSchedulerStorage(
+                jobMetadataStore = jobStore,
+                runHistoryStore = runStore,
+                workerRegistry = baseBundle.workerRegistry
+            )
+            return StorageBundle(
+                storage = composite,
+                leaseStore = baseBundle.leaseStore,
+                taskQueue = baseBundle.taskQueue,
+                jobMetadataStore = jobStore,
+                runHistoryStore = runStore,
+                workerRegistry = baseBundle.workerRegistry,
+                outboxStore = outboxStore
+            )
+        }
+
         val metadataDbPath = System.getenv("METADATA_SQLITE_PATH")
             ?: System.getenv("METADATA_DB_PATH")
 
-        val baseBundle = createFromEnv()
-
         if (!metadataDbPath.isNullOrBlank()) {
-            logger.info("Coordinator: Attaching dedicated JobMetadataStore at $metadataDbPath")
+            logger.info("Coordinator: Attaching dedicated SQLite JobMetadataStore at $metadataDbPath")
             val jobStore = SqliteJobMetadataStore(metadataDbPath)
             val composite = CompositeSchedulerStorage(
                 jobMetadataStore = jobStore,
@@ -107,6 +175,24 @@ object StorageFactory {
                 jobMetadataStore = redisStorage,
                 runHistoryStore = redisStorage,
                 workerRegistry = redisStorage
+            )
+        }
+
+        val pgUrl = getPostgresJdbcUrl()
+        if (!pgUrl.isNullOrBlank()) {
+            val pgUser = System.getenv("POSTGRES_USER") ?: "postgres"
+            val pgPass = System.getenv("POSTGRES_PASSWORD") ?: "postgres"
+            val maxPool = System.getenv("POSTGRES_MAX_POOL_SIZE")?.toIntOrNull() ?: 15
+            logger.info("Initializing full PostgreSQL storage at $pgUrl")
+            val pgStorage = PostgresSchedulerStorage(pgUrl, pgUser, pgPass, maxPool)
+            return StorageBundle(
+                storage = pgStorage,
+                leaseStore = InMemoryLeaseStore(),
+                taskQueue = InMemoryTaskQueue(),
+                jobMetadataStore = pgStorage,
+                runHistoryStore = pgStorage,
+                workerRegistry = pgStorage,
+                outboxStore = pgStorage
             )
         }
 
