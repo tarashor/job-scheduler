@@ -9,7 +9,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Database-per-Microservice Domain Stores:
- * 1. JobMetadataStore: Owned by scheduler-api for permanent Job/DAG specifications.
+ * 1. JobMetadataStore: Owned by scheduler-api for permanent Job specifications.
  * 2. RunHistoryStore: Owned by history & audit service for run executions and task instances.
  * 3. WorkerRegistry: Used for worker health monitoring, heartbeats, and capacity tracking.
  */

@@ -3,7 +3,6 @@ package com.tarashor.scheduler.coordinator
 import com.tarashor.scheduler.cluster.LeaderElector
 import com.tarashor.scheduler.cluster.LeaseStore
 import com.tarashor.scheduler.core.cron.CronParser
-import com.tarashor.scheduler.core.dag.DAGEngine
 import com.tarashor.scheduler.core.model.*
 import com.tarashor.scheduler.queue.TaskQueue
 import com.tarashor.scheduler.storage.CompositeSchedulerStorage
@@ -79,13 +78,12 @@ class SchedulerCoordinator(
         logger.info("Starting SchedulerCoordinator '$coordinatorId'")
         leaderElector.start()
 
-        // 1. Scheduling & DAG ticker loop (runs only when this node is leader)
+        // 1. Scheduling clock loop (runs only when this node is leader)
         scope.launch {
             while (isRunning.get()) {
                 if (isLeader()) {
                     try {
                         tickSchedulingClock()
-                        tickActiveDagRuns()
                         reapDeadWorkers()
                     } catch (e: CancellationException) {
                         break
@@ -155,48 +153,6 @@ class SchedulerCoordinator(
         }
     }
 
-    private suspend fun tickActiveDagRuns() {
-        val activeRuns = storage.listRuns(50).filter { it.status == JobStatus.RUNNING }
-        for (run in activeRuns) {
-            val job = storage.getJob(run.jobId) ?: continue
-            val instances = storage.getTaskInstancesForRun(run.runId).associateBy { it.taskId }.toMutableMap()
-
-            // 1. Check if newly ready tasks exist
-            val readyTasks = DAGEngine.findReadyTasks(job.tasks, instances)
-            for (readyTask in readyTasks) {
-                val currentInst = instances[readyTask.taskId] ?: TaskInstance(
-                    taskInstanceId = "${run.runId}-${readyTask.taskId}-1",
-                    runId = run.runId,
-                    jobId = job.jobId,
-                    taskId = readyTask.taskId,
-                    status = TaskStatus.READY,
-                    attempt = 1,
-                    maxRetries = readyTask.maxRetries,
-                    action = readyTask.action,
-                    scheduledAtEpochMs = System.currentTimeMillis(),
-                    fencingToken = getActiveFencingToken()
-                )
-                val queued = currentInst.copy(status = TaskStatus.QUEUED)
-                storage.saveTaskInstance(queued)
-                instances[readyTask.taskId] = queued
-                taskQueue.enqueue(queued)
-                logger.info("DAG tick: Enqueued ready task '${readyTask.taskId}' for run '${run.runId}'")
-            }
-
-            // 2. Check overall status
-            val status = DAGEngine.evaluateJobStatus(job.tasks, instances)
-            if (status != JobStatus.RUNNING) {
-                storage.saveRun(
-                    run.copy(
-                        status = status,
-                        completedAtEpochMs = System.currentTimeMillis()
-                    )
-                )
-                logger.info("DAG tick: Run '${run.runId}' evaluated to terminal status: $status")
-            }
-        }
-    }
-
     suspend fun triggerJob(jobId: String, triggerSource: String = "MANUAL"): JobRun {
         val job = storage.getJob(jobId) ?: throw IllegalArgumentException("Job '$jobId' not found")
         val runId = UUID.randomUUID().toString()
@@ -204,9 +160,6 @@ class SchedulerCoordinator(
         val fencingToken = getActiveFencingToken()
 
         logger.info("Triggering job '$jobId' (RunId: $runId, Source: $triggerSource, FencingToken: $fencingToken)")
-
-        // Validate DAG structure
-        DAGEngine.validateAndSort(job.tasks)
 
         val run = JobRun(
             runId = runId,
@@ -218,15 +171,14 @@ class SchedulerCoordinator(
         )
         storage.saveRun(run)
 
-        // Create TaskInstances for each TaskSpec
-        val initialInstances = mutableMapOf<String, TaskInstance>()
+        // Directly enqueue all tasks of the job
         for (taskSpec in job.tasks) {
             val instance = TaskInstance(
                 taskInstanceId = "$runId-${taskSpec.taskId}-1",
                 runId = runId,
                 jobId = jobId,
                 taskId = taskSpec.taskId,
-                status = TaskStatus.WAITING_DEPENDENCIES,
+                status = TaskStatus.QUEUED,
                 attempt = 1,
                 maxRetries = taskSpec.maxRetries,
                 action = taskSpec.action,
@@ -234,16 +186,7 @@ class SchedulerCoordinator(
                 fencingToken = fencingToken
             )
             storage.saveTaskInstance(instance)
-            initialInstances[taskSpec.taskId] = instance
-        }
-
-        // Find initial ready tasks (in-degree = 0) and enqueue them
-        val readyTasks = DAGEngine.findReadyTasks(job.tasks, initialInstances)
-        for (task in readyTasks) {
-            val inst = initialInstances[task.taskId]!!
-            val queuedInst = inst.copy(status = TaskStatus.QUEUED)
-            storage.saveTaskInstance(queuedInst)
-            taskQueue.enqueue(queuedInst)
+            taskQueue.enqueue(instance)
         }
 
         return run
@@ -254,8 +197,6 @@ class SchedulerCoordinator(
         val run = storage.getRun(taskInstance.runId) ?: return
         if (run.status != JobStatus.RUNNING) return
 
-        val instances = storage.getTaskInstancesForRun(taskInstance.runId).associateBy { it.taskId }.toMutableMap()
-
         if (result.success) {
             val completedInst = taskInstance.copy(
                 status = TaskStatus.COMPLETED,
@@ -263,34 +204,11 @@ class SchedulerCoordinator(
                 output = result.output
             )
             storage.saveTaskInstance(completedInst)
-            instances[taskInstance.taskId] = completedInst
             logger.info("Task '${taskInstance.taskId}' in run '${run.runId}' COMPLETED successfully")
 
-            // Evaluate downstream tasks in DAG
-            val readyTasks = DAGEngine.findReadyTasks(job.tasks, instances)
-            for (readyTask in readyTasks) {
-                val currentInst = instances[readyTask.taskId] ?: TaskInstance(
-                    taskInstanceId = "${run.runId}-${readyTask.taskId}-1",
-                    runId = run.runId,
-                    jobId = job.jobId,
-                    taskId = readyTask.taskId,
-                    status = TaskStatus.READY,
-                    attempt = 1,
-                    maxRetries = readyTask.maxRetries,
-                    action = readyTask.action,
-                    scheduledAtEpochMs = System.currentTimeMillis(),
-                    fencingToken = getActiveFencingToken()
-                )
-                val queued = currentInst.copy(status = TaskStatus.QUEUED)
-                storage.saveTaskInstance(queued)
-                instances[readyTask.taskId] = queued
-                taskQueue.enqueue(queued)
-                logger.info("DAG: Dependent task '${readyTask.taskId}' is now READY and QUEUED")
-            }
-
-            // Check if entire JobRun is complete
-            val overallStatus = DAGEngine.evaluateJobStatus(job.tasks, instances)
-            if (overallStatus == JobStatus.COMPLETED) {
+            // Check if all tasks in this run are completed
+            val allInstances = storage.getTaskInstancesForRun(taskInstance.runId)
+            if (allInstances.all { it.status == TaskStatus.COMPLETED }) {
                 storage.saveRun(
                     run.copy(
                         status = JobStatus.COMPLETED,

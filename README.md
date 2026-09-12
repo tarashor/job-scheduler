@@ -1,4 +1,4 @@
-# Розподілений планувальник завдань та оркестратор робочих процесів (Мікросервісна архітектура)
+# Розподілений планувальник завдань (Мікросервісна архітектура)
 
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.4.0-blue.svg)](https://kotlinlang.org)
 [![JDK](https://img.shields.io/badge/JDK-25%2B-orange.svg)](https://openjdk.org)
@@ -6,7 +6,7 @@
 [![Docker Compose](https://img.shields.io/badge/Docker%20Compose-Ready-blue.svg)]()
 [![Tests](https://img.shields.io/badge/Tests-Passing-brightgreen.svg)]()
 
-Розподілений планувальник завдань та оркестратор DAG-робочих процесів, декомпонований на **незалежні контейнеризовані мікросервіси** та спроєктований за канонічним питанням із **System Design співбесід** (*«Design a Distributed Job Scheduler / Workflow Orchestrator like Temporal, Airflow, or Quartz»*), які проводять у Google, Meta, Uber, Amazon та Netflix.
+Розподілений планувальник завдань, декомпонований на **незалежні контейнеризовані мікросервіси** та спроєктований за канонічним питанням із **System Design співбесід** (*«Design a Distributed Job Scheduler like Quartz, Temporal, or Celery»*), які проводять у Google, Meta, Uber, Amazon та Netflix.
 
 ---
 
@@ -23,7 +23,7 @@
    - [Захист від Split-Brain через монотонні токени розмежування (Fencing Tokens)](#захист-від-split-brain-через-монотонні-токени-розмежування-fencing-tokens)
    - [Високоточне відкладене планування (Дворівнева бакетизація часу)](#високоточне-відкладене-планування-дворівнева-бакетизація-часу)
    - [Модель диспетчеризації: Push проти Pull та Backpressure](#модель-диспетчеризації-push-проти-pull-та-backpressure)
-   - [Оркестрація DAG через алгоритм Кана (Kahn's Algorithm)](#оркестрація-dag-через-алгоритм-кана-kahns-algorithm)
+   - [Паралельне виконання незалежних завдань](#паралельне-виконання-незалежних-завдань)
    - [Моніторинг воркерів, Heartbeats та рекламація завдань](#моніторинг-воркерів-heartbeats-та-рекламація-завдань)
    - [Експоненційне відтермінування з джитером (Exponential Backoff with Jitter) та черга DLQ](#експоненційне-відтермінування-з-джитером-exponential-backoff-with-jitter-та-черга-dlq)
    - [Детальне архітектурне обґрунтування: Чому обрано Redis замість Kafka](#детальне-архітектурне-обґрунтування-чому-обрано-redis-замість-kafka)
@@ -49,7 +49,7 @@ flowchart TD
     ClientSvc["Клієнтські мікросервіси<br/>(Order, Billing, Analytics)"] -->|"REST / HTTP"| API["1. scheduler-api Мікросервіс<br/>(Порт :8080)"]
     
     subgraph APIDatabase ["Доменна БД API (Database-per-Microservice)"]
-        MetaDB[("Metadata DB: SQLite / PostgreSQL<br/>• Специфікації завдань (JobSpec)<br/>• Топологія DAG графів<br/>• Cron-розклади")]
+        MetaDB[("Metadata DB: SQLite / PostgreSQL<br/>• Специфікації завдань (JobSpec)<br/>• Специфікації дій (TaskAction)<br/>• Cron-розклади")]
     end
     API <-->|"CRUD метаданих завдань"| MetaDB
 
@@ -67,7 +67,7 @@ flowchart TD
     end
 
     C1 <-->|"Читання розкладів"| MetaDB
-    C1 -- "Таймер розкладу завдань<br/>Оцінювач залежностей DAG<br/>Reaper завислих воркерів" --> Redis
+    C1 -- "Таймер розкладу завдань<br/>Диспетчеризація завдань<br/>Reaper завислих воркерів" --> Redis
 
     subgraph WorkerPool ["3. scheduler-worker Мікросервісні поди (Stateless)"]
         W1["Воркер-под Alpha<br/>(Stateless, місткість: 4)"]
@@ -88,7 +88,7 @@ flowchart TD
 
 ### Діаграма послідовності (Sequence Diagram)
 
-Діаграма демонструє наскрізний життєвий цикл: від реєстрації DAG-пайплайну клієнтським мікросервісом до лідерської координації, паралельного виконання воркерами через HTTP-вебхуки та автоматичного просування графа залежностей.
+Діаграма демонструє наскрізний життєвий цикл: від реєстрації мульти-завдання клієнтським мікросервісом до лідерської координації, паралельного виконання воркерами через HTTP-вебхуки та оновлення статусу запуску.
 
 ```mermaid
 sequenceDiagram
@@ -105,52 +105,45 @@ sequenceDiagram
     Coord->>Redis: Оновлення лідерського лізу з Fencing Token
     Redis-->>Coord: Підтверджено (OK)
 
-    Note over Client,API: 1. Реєстрація та запуск DAG завдання
-    Client->>API: POST /api/jobs (Опис DAG: Списання -> Резервування)
-    API->>API: Валідація DAG на цикли (Алгоритм Кана)
+    Note over Client,API: 1. Реєстрація та запуск завдання
+    Client->>API: POST /api/jobs (Опис джоби з незалежними завданнями)
     API->>Redis: Збереження специфікації JobSpec
     API-->>Client: 201 Created
 
     Client->>API: POST /api/jobs/{id}/trigger
     API->>Redis: Створення JobRun (status=RUNNING)
-    API->>Redis: Enqueue Початкових завдань (in-degree=0) у ZSET
+    API->>Redis: Прямий Enqueue усіх незалежних завдань у ZSET
     API-->>Client: 202 Accepted (RunId згенеровано)
 
-    Note over Redis,W1: 2. Worker Alpha бере перше готове завдання (Pull)
+    Note over Redis,W1: 2. Worker Alpha бере перше завдання (Pull)
     W1->>Redis: Опитування черги: ZPOPMIN (score <= now)
     Redis-->>W1: Task 1: "Списання оплати" (HTTP POST)
     W1->>Redis: Оновлення статусу Task 1: RUNNING (Worker=Alpha)
 
-    par Виконання завдання та фоновий Heartbeat
+    par Виконання Task 1 та фоновий Heartbeat
         W1->>Target: HTTP POST /v1/charge (з Idempotency-Key)
         Target-->>W1: 200 OK (Оплату успішно проведено)
-    and Періодичний Heartbeat воркера
+    and Періодичний Heartbeat воркера Alpha
         W1->>Redis: Heartbeat: load=1, activeTasks=[Task 1]
     end
 
     W1->>Redis: Оновлення статусу Task 1: COMPLETED
 
-    Note over Coord,Redis: 3. Координатор просуває DAG граф
-    Coord->>Redis: Фоновий тик: перевірка активних запусків
-    Redis-->>Coord: Task 1 завершено! Task 2 залежить від Task 1
-    Coord->>Coord: Обчислення in-degree для Task 2 -> 0 (READY)
-    Coord->>Redis: Enqueue Task 2 у ZSET чергу
-
-    Note over Redis,W2: 4. Worker Beta забирає розблоковане завдання
+    Note over Redis,W2: 3. Worker Beta паралельно забирає друге завдання
     W2->>Redis: Опитування черги: ZPOPMIN
     Redis-->>W2: Task 2: "Резервування товару" (HTTP POST)
     W2->>Target: HTTP POST /v1/reserve
     Target-->>W2: 200 OK (Товар зарезервовано)
     W2->>Redis: Оновлення статусу Task 2: COMPLETED
 
-    Note over Coord,Redis: 5. Завершення всього пайплайну
-    Coord->>Redis: Усі завдання DAG завершено успішно
+    Note over Coord,Redis: 4. Завершення всього запуску
+    Coord->>Redis: Усі завдання джоби завершено успішно
     Coord->>Redis: Оновлення JobRun: status=COMPLETED
     
     Client->>API: GET /api/runs/{runId}
     API->>Redis: Читання стану запуску та завдань
     Redis-->>API: JobRun COMPLETED з результатами
-    API-->>Client: 200 OK (Пайплайн успішно виконано)
+    API-->>Client: 200 OK (Завдання успішно виконано)
 ```
 
 ---
@@ -159,11 +152,11 @@ sequenceDiagram
 
 | Мікросервіс | Модуль коду | Власна база даних | Стратегія масштабування | Основна відповідальність |
 | :--- | :--- | :--- | :--- | :--- |
-| **`scheduler-api`** | `scheduler-api` | **`JobMetadataStore`** (SQLite / PostgreSQL) | Stateless ($N$ реплік за Ingress) | Вхідний REST API, збереження специфікацій завдань, валідація графів DAG, запит статусу запусків, вбудований Web Dashboard. |
-| **`scheduler-coordinator`** | `scheduler-coordinator` | **`TaskQueue` + `LeaseStore`** (Redis Cluster) | Active-Standby ($2$–$3$ репліки) | Годинник розкладу, подовження лідерського лізу з Fencing Token, просування залежностей DAG, Reaper завислих воркерів. |
+| **`scheduler-api`** | `scheduler-api` | **`JobMetadataStore`** (SQLite / PostgreSQL) | Stateless ($N$ реплік за Ingress) | Вхідний REST API, збереження специфікацій завдань, запит статусу запусків, вбудований Web Dashboard. |
+| **`scheduler-coordinator`** | `scheduler-coordinator` | **`TaskQueue` + `LeaseStore`** (Redis Cluster) | Active-Standby ($2$–$3$ репліки) | Годинник розкладу, подовження лідерського лізу з Fencing Token, диспетчеризація завдань, Reaper завислих воркерів. |
 | **`scheduler-worker`** | `scheduler-worker` | **Stateless (БЕЗ БД)** | Горизонтальне HPA ($N$ подів) | Повністю без збереження стану. Витягує завдання з черги, виконує HTTP-вебхуки/скрипти, надсилає heartbeats у `WorkerRegistry`. |
 | **`scheduler-storage`** | `scheduler-storage` | Доменні модулі сховищ | Спільна бібліотека | Ізольовані контракти `JobMetadataStore`, `RunHistoryStore`, `WorkerRegistry`, `CompositeSchedulerStorage`, підтримка SQLite та Redis. |
-| **`scheduler-common`** | `scheduler-common` | — | Спільна бібліотека | Доменні моделі даних, рушій DAG на базі алгоритму Кана та парсер 5-значних Cron-виразів. |
+| **`scheduler-common`** | `scheduler-common` | — | Спільна бібліотека | Доменні моделі даних, парсер 5-значних Cron-виразів. |
 
 ---
 
@@ -176,8 +169,8 @@ sequenceDiagram
    - **Миттєвий запуск (Immediate)**: Запуск завдання одразу після отримання запиту.
    - **Одноразові відкладені завдання (Future Date / One-off)**: Виконання у визначений момент у майбутньому (наприклад, через 2 години або 15 вересня о 14:00).
    - **Періодичні розклади (Recurring Schedule / Cron)**: Регулярний запуск за розкладом (наприклад, *"щодня о 10:00 AM"*, *"кожні 5 хвилин"*).
-2. **Залежності робочих процесів (DAG Workflows)**:
-   - Підтримка складних ланцюжків завдань, де наступні кроки запускаються лише після успіху попередніх (перевірка циклів за **алгоритмом Кана**).
+2. **Паралельне виконання мульти-завдань (Multi-Task Batch Jobs)**:
+   - Підтримка групування незалежних завдань у межах однієї джоби, які виконуються паралельно та одночасно без затримок на очікування взаємних залежностей.
 3. **Моніторинг статусу (Status Monitoring)**:
    - Можливість перевіряти статус завдань та запусків у реальному часі (`QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `DEAD_LETTER`).
 
@@ -242,11 +235,11 @@ sequenceDiagram
 - **Недоліки Push-моделі**: Майстер надсилає завдання безпосередньо воркеру. Якщо Воркер A зайнятий важким обчисленням, він перевантажується, тоді як Воркер B простоює.
 - **Переваги Pull-моделі (реалізовано тут)**: Воркери витягують нові завдання з черги тільки за наявності вільних ресурсів (`currentLoad < capacity`). Це забезпечує **природне балансування навантаження** та захист від перевантаження (**Backpressure**).
 
-### Оркестрація DAG через алгоритм Кана (Kahn's Algorithm)
-- **Валідація графа**: Під час реєстрації завдання перевіряються за допомогою алгоритму Кана:
-  $$\text{inDegree}(v) = \text{кількість незавершених вхідних залежностей}$$
-  Якщо довжина топологічно відсортованого списку менша за загальну кількість завдань, граф містить цикл і відхиляється на етапі валідації.
-- **Динамічний рух графа**: Коли Task $U$ переходить у статус `COMPLETED`, координатор перевіряє всі залежні завдання $V$. Якщо для всіх батьківських кроків $P$ статус дорівнює `COMPLETED`, Task $V$ автоматично стає в чергу на виконання.
+### Паралельне виконання незалежних завдань (Independent Task Execution & Concurrency)
+- **Відсутність взаємних залежностей**: Завдання (`TaskSpec`) у системі спроєктовані як повністю незалежні одиниці роботи. Це усуває блокування графів залежностей (DAG), необхідність підрахунку степенів вершин (in-degree) та затримки очікування попередників.
+- **Миттєва паралельна постановка в чергу**: При спрацюванні джоби всі її завдання негайно отримують статус `QUEUED` та додаються до черги диспетчеризації `taskQueue.enqueue(...)`.
+- **Максимальний паралелізм та High-Load (10k QPS)**: Завдяки відсутності блокуючих зв'язків воркери в кластері розбирають завдання з черги паралельно, забезпечуючи рівномірне навантаження та мінімальну затримку (SLA $\le 2\text{s}$).
+- **Оцінка завершення джоби**: Запуск `JobRun` переходить у статус `COMPLETED`, коли всі його завдання успішно завершені (`status == COMPLETED`). Якщо хоча б одне завдання вичерпує ліміт спроб і переміщується в Dead Letter Queue (`DEAD_LETTER`), статус запуску переходить у `FAILED`.
 
 ### Моніторинг воркерів, Heartbeats та рекламація завдань
 - Кожні 2 секунди воркери надсилають heartbeat: `WorkerInfo(workerId, capacity, currentLoad, activeTasks)`.
@@ -312,7 +305,7 @@ flowchart TD
 ```
 
 - **Kafka на вході**: Поглинає величезні сплески вхідних подій з високою швидкістю.
-- **Redis у центрі**: Забезпечує роботу рушія завдань — перевірку умов DAG, похвилинну/посекундну точність через `ZSET` та арбітраж лідера.
+- **Redis у центрі**: Забезпечує роботу рушія завдань — похвилинну/посекундну точність через `ZSET`, паралельний розподіл завдань та арбітраж лідера.
 - **Kafka на виході**: Зберігає повний незмінний аудит усіх запусків для аналітики та довгострокового збереження.
 
 ---
@@ -334,7 +327,7 @@ flowchart TD
     Client -->|"HTTP POST /api/jobs"| API["1. scheduler-api"]
 
     subgraph APIDomain ["Домен метаданих (scheduler-api)"]
-        API -->|"CRUD конфігурацій"| APIDB[("Persistent Metadata DB<br/>PostgreSQL / CockroachDB<br/>• Специфікації завдань (JobSpec)<br/>• Топологія DAG графів<br/>• Cron-розклади та політики")]
+        API -->|"CRUD конфігурацій"| APIDB[("Persistent Metadata DB<br/>PostgreSQL / CockroachDB<br/>• Специфікації завдань (JobSpec)<br/>• Специфікації дій (TaskAction)<br/>• Cron-розклади та політики")]
         API -->|"Transactional Outbox"| OutboxTable["Таблиця outbox_events"]
     end
 
@@ -361,14 +354,14 @@ flowchart TD
         HistorySvc --> AnalyticsDB[("Time-Series / Cold Storage<br/>ClickHouse / ScyllaDB / S3<br/>• 26 ТБ журналу запусків / 30 днів<br/>• Метрики SLA та затримок<br/>• Повні логи та трасування помилок")]
     end
 
-    HistorySvc -.->|"Просування графа DAG"| Coord
+    HistorySvc -.->|"Метрики виконання"| Coord
 ```
 
 #### Декомпозиція та моделі даних за мікросервісами:
 
 | Мікросервіс | Обране сховище даних | Модель та патерн доступу | Життєвий цикл даних |
 | :--- | :--- | :--- | :--- |
-| **`scheduler-api`** | **PostgreSQL** / **CockroachDB** | **ACID / Relational**: Збереження конфігурацій завдань (`JobSpec`), графів DAG (`dag_nodes`, `dag_edges`), Cron-розкладів, прав доступу (RBAC). Низький QPS, висока надійність. | Довгостроковий (роки), дискове збереження, регулярні бекапи. |
+| **`scheduler-api`** | **PostgreSQL** / **CockroachDB** | **ACID / Relational**: Збереження конфігурацій завдань (`JobSpec`), списків дій (`TaskAction`), Cron-розкладів, прав доступу (RBAC). Низький QPS, висока надійність. | Довгостроковий (роки), дискове збереження, регулярні бекапи. |
 | **`scheduler-coordinator`** | **Redis Cluster** (виділений) | **In-Memory Key-Value & SkipList**: Шардовані черги затримок (`ZSET`), лізингові блокування лідера (`SET NX PX`), heartbeat-хеші. Екстремальний QPS ($10\text{k} - 30\text{k}$ оп/сек), $O(\log N)$ затримки. | Тимчасовий (хвилини/години). Дані видаляються з черги відразу після забору воркером. |
 | **`scheduler-worker`** | **Stateless (БЕЗ власної БД)** | **No DB**: Воркери повністю позбавлені прямого доступу до баз даних. Отримують лише `TaskExecutionPayload` (URL, параметри, таймаут, `Idempotency-Key`) і публікують події статусу. | Відсутній (повна незалежність від сховищ). |
 | **`scheduler-history`** | **ClickHouse** / **ScyllaDB / S3** | **Append-Only Time-Series**: Журнал запусків `job_runs` та `task_executions`. Високошвидкісний паралельний запис ($10{,}000$ подій/сек), компресія у 5–10 разів, швидкі аналітичні агрегації по SLA. | Середньо- та довгостроковий (30 днів у гарячій БД $\approx 26\text{ ТБ}$, далі вивантаження в S3 Iceberg). |
@@ -378,7 +371,7 @@ flowchart TD
 1. `scheduler-api` зберігає завдання у PostgreSQL і в тій самій локальній транзакції пише подію в таблицю `outbox_events`.
 2. Фоновий ретранслятор (Debezium CDC або Transactional Log Miner) публікує подію `JobScheduledEvent` у Kafka/NATS.
 3. `scheduler-coordinator` отримує подію з шини та заштовхує інстанс завдання у відповідний шард черги Redis (`delay_queue:{shard}`).
-4. Після завершення воркер надсилає подію `TaskExecutedEvent`. Сервіс історії фіксує її в ClickHouse, а координатор оцінює готовність наступних кроків графа DAG.
+4. Після завершення воркер надсилає подію `TaskExecutedEvent`. Сервіс історії фіксує її в ClickHouse, а координатор перевіряє завершення всіх завдань запуску.
 
 ---
 
@@ -392,8 +385,7 @@ job-scheduler/
 ├── scheduler-common/                     # [Спільна бібліотека]
 │   └── src/main/kotlin/com/tarashor/scheduler/core/
 │       ├── model/Models.kt               # Доменні моделі даних та DTO
-│       ├── cron/CronParser.kt            # Парсер 5-значних Cron-виразів
-│       └── dag/DAGEngine.kt              # Топологічне сортування за алгоритмом Кана
+│       └── cron/CronParser.kt            # Парсер 5-значних Cron-виразів
 ├── scheduler-storage/                    # [Шар даних: Database-per-Microservice]
 │   ├── src/main/kotlin/com/tarashor/scheduler/
 │   │   ├── storage/Storage.kt            # Інтерфейси JobMetadataStore, RunHistoryStore, WorkerRegistry та SQLite
@@ -411,9 +403,9 @@ job-scheduler/
 ├── scheduler-coordinator/                # [Мікросервіс 2: Distributed Coordinator]
 │   ├── src/main/kotlin/com/tarashor/scheduler/coordinator/
 │   │   ├── CoordinatorApp.kt             # Головна точка входу координатора
-│   │   └── SchedulerCoordinator.kt       # Вибори лідера, годинник розкладу та стан DAG
+│   │   └── SchedulerCoordinator.kt       # Вибори лідера, годинник розкладу та життєвий цикл запусків
 │   └── src/test/kotlin/com/tarashor/scheduler/
-│       └── EndToEndSchedulerTest.kt      # Наскрізні тести DAG та decoupled Database-per-Microservice
+│       └── EndToEndSchedulerTest.kt      # Наскрізні тести паралельного виконання та decoupled Database-per-Microservice
 └── scheduler-worker/                     # [Мікросервіс 3: Stateless Worker Daemon]
     └── src/main/kotlin/com/tarashor/scheduler/worker/
         ├── WorkerApp.kt                  # Головна точка входу воркера (БЕЗ доступу до метаданих БД)
@@ -471,7 +463,7 @@ WORKER_ID=worker-beta ./gradlew :scheduler-worker:run
 Панель надає візуальний контроль у реальному часі:
 - **Топологія кластера**: Активний лідер, поточний Fencing Token, кількість зареєстрованих воркерів.
 - **Воркери**: Статус працездатності, місткість, поточне завантаження, затримка heartbeat.
-- **Визначені завдання**: Перелік завдань, cron-розклади та графічна структура DAG.
+- **Визначені завдання**: Перелік завдань, cron-розклади та списки дій.
 - **Активні запуски**: Покроковий стан виконання завдань (`QUEUED` $\rightarrow$ `RUNNING` $\rightarrow$ `COMPLETED`).
 - **Черга мертвих листів (DLQ)**: Перегляд помилок та кнопка **«Retry»** для повторного запуску.
 - **Симуляція аварії лідера**: Кнопка ручного складання повноважень лідера для спостереження за автоматичним перехопленням лідерства резервним координатором.
@@ -494,13 +486,13 @@ curl -s http://localhost:8080/api/health | jq
 }
 ```
 
-#### 2. Реєстрація міжсервісного DAG-робочого процесу
+#### 2. Реєстрація пакетного завдання (Batch Job)
 ```bash
 curl -X POST http://localhost:8080/api/jobs \
   -H "Content-Type: application/json" \
   -d '{
-    "jobId": "order-fulfillment-workflow",
-    "name": "Order Fulfillment Workflow",
+    "jobId": "order-fulfillment-job",
+    "name": "Order Fulfillment Job",
     "schedule": { "type": "Immediate" },
     "tasks": [
       {
@@ -530,7 +522,6 @@ curl -X POST http://localhost:8080/api/jobs \
       {
         "taskId": "dispatch-shipment",
         "name": "Dispatch Shipment",
-        "dependencies": ["charge-payment", "reserve-inventory"],
         "action": { 
           "type": "Http", 
           "url": "https://api.shipping-service.internal/v1/dispatch",
@@ -546,10 +537,10 @@ curl -X POST http://localhost:8080/api/jobs \
 
 #### 3. Ручний запуск завдання
 ```bash
-curl -X POST http://localhost:8080/api/jobs/order-fulfillment-workflow/trigger
+curl -X POST http://localhost:8080/api/jobs/order-fulfillment-job/trigger
 ```
 
-#### 4. Запит прогресу виконання графа DAG
+#### 4. Запит прогресу виконання завдань
 ```bash
 curl -s http://localhost:8080/api/runs | jq
 ```
@@ -570,9 +561,9 @@ curl -X POST http://localhost:8080/api/cluster/stepdown
 
 | Субпроєкт | Що перевіряється тестами |
 | :--- | :--- |
-| **`scheduler-common`** | Парсинг Cron-виразів, кроки (`*/5`), діапазони (`1-5`), пресети (`@daily`), сортування за алгоритмом Кана, ромбовидні DAG-залежності, детекція циклів. |
+| **`scheduler-common`** | Парсинг Cron-виразів, кроки (`*/5`), діапазони (`1-5`), пресети (`@daily`), валідація та серіалізація моделей завдань. |
 | **`scheduler-storage`** | **Ізоляція Database-per-Microservice** (`DatabasePerMicroserviceTest`): перевірка створення окремих схем БД без перетину таблиць (`jobs`, `job_runs`, `workers`), робота `CompositeSchedulerStorage`. Атомарне взяття лізу (`LeaderElectionTest`), пріоритетна черга затримок Redis `ZSET`, математика backoff-джитеру та ізоляція в DLQ (`TaskQueueAndDLQTest`). |
-| **`scheduler-coordinator`** | **Декомпонована оркестрація** (`EndToEndSchedulerTest`): наскрізний запуск DAG зі Stateless-воркером (без доступу до метаданих БД), автоматичний Reaper для аварійних воркерів та перехоплення лідерства. |
+| **`scheduler-coordinator`** | **Декомпонована оркестрація** (`EndToEndSchedulerTest`): наскрізний запуск незалежних завдань зі Stateless-воркером (без доступу до метаданих БД), автоматичний Reaper для аварійних воркерів та перехоплення лідерства. |
 
 ---
 

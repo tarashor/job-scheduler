@@ -1,7 +1,6 @@
 package com.tarashor.scheduler.api
 
 import com.tarashor.scheduler.cluster.LeaseStore
-import com.tarashor.scheduler.core.dag.DAGEngine
 import com.tarashor.scheduler.core.model.*
 import com.tarashor.scheduler.queue.TaskQueue
 import com.tarashor.scheduler.storage.CompositeSchedulerStorage
@@ -128,12 +127,6 @@ class SchedulerApiServer(
 
                 post("/api/jobs") {
                     val job = call.receive<JobSpec>()
-                    // Validate DAG
-                    try {
-                        DAGEngine.validateAndSort(job.tasks)
-                    } catch (e: Exception) {
-                        return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Invalid DAG")))
-                    }
                     storage.saveJob(job)
                     call.respond(HttpStatusCode.Created, job)
                 }
@@ -229,12 +222,12 @@ class SchedulerApiServer(
                     }
                 }
 
-                // Sample DAG Trigger Helper
-                post("/api/samples/dag") {
-                    val jobId = "sample-etl-dag"
+                // Sample Job Trigger Helper
+                post("/api/samples/job") {
+                    val jobId = "sample-parallel-job"
                     val sampleJob = JobSpec(
                         jobId = jobId,
-                        name = "E-Commerce Daily ETL Pipeline",
+                        name = "E-Commerce Batch Processing Job",
                         schedule = ScheduleSpec.Immediate,
                         tasks = listOf(
                             TaskSpec(
@@ -252,21 +245,58 @@ class SchedulerApiServer(
                             TaskSpec(
                                 taskId = "transform-metrics",
                                 name = "Transform & Aggregate",
-                                dependencies = setOf("extract-sales", "extract-inventory"),
                                 action = TaskAction.Simulate(durationMs = 800, shouldFail = false, message = "Aggregated daily revenue and inventory turnover"),
                                 timeoutMs = 10_000
                             ),
                             TaskSpec(
                                 taskId = "load-warehouse",
                                 name = "Load into Data Warehouse",
-                                dependencies = setOf("transform-metrics"),
                                 action = TaskAction.Shell("echo 'Successfully loaded 1820 rows into Data Warehouse'"),
                                 timeoutMs = 10_000
                             )
                         )
                     )
                     storage.saveJob(sampleJob)
-                    val run = triggerJob(jobId, triggerSource = "SAMPLE_DAG_TRIGGER")
+                    val run = triggerJob(jobId, triggerSource = "SAMPLE_JOB_TRIGGER")
+                    call.respond(HttpStatusCode.Created, run)
+                }
+
+                post("/api/samples/dag") {
+                    // Backward-compatible endpoint alias
+                    val jobId = "sample-parallel-job"
+                    val sampleJob = JobSpec(
+                        jobId = jobId,
+                        name = "E-Commerce Batch Processing Job",
+                        schedule = ScheduleSpec.Immediate,
+                        tasks = listOf(
+                            TaskSpec(
+                                taskId = "extract-sales",
+                                name = "Extract Sales Data",
+                                action = TaskAction.Shell("echo 'Extracted 1500 sales records'"),
+                                timeoutMs = 10_000
+                            ),
+                            TaskSpec(
+                                taskId = "extract-inventory",
+                                name = "Extract Inventory Data",
+                                action = TaskAction.Shell("echo 'Extracted 320 inventory items'"),
+                                timeoutMs = 10_000
+                            ),
+                            TaskSpec(
+                                taskId = "transform-metrics",
+                                name = "Transform & Aggregate",
+                                action = TaskAction.Simulate(durationMs = 800, shouldFail = false, message = "Aggregated daily revenue and inventory turnover"),
+                                timeoutMs = 10_000
+                            ),
+                            TaskSpec(
+                                taskId = "load-warehouse",
+                                name = "Load into Data Warehouse",
+                                action = TaskAction.Shell("echo 'Successfully loaded 1820 rows into Data Warehouse'"),
+                                timeoutMs = 10_000
+                            )
+                        )
+                    )
+                    storage.saveJob(sampleJob)
+                    val run = triggerJob(jobId, triggerSource = "SAMPLE_JOB_TRIGGER")
                     call.respond(HttpStatusCode.Created, run)
                 }
             }
@@ -279,8 +309,6 @@ class SchedulerApiServer(
         val now = System.currentTimeMillis()
         val fencingToken = leaseStore.getCurrentLease()?.fencingToken ?: 1L
 
-        DAGEngine.validateAndSort(job.tasks)
-
         val run = JobRun(
             runId = runId,
             jobId = jobId,
@@ -291,14 +319,13 @@ class SchedulerApiServer(
         )
         storage.saveRun(run)
 
-        val initialInstances = mutableMapOf<String, TaskInstance>()
         for (taskSpec in job.tasks) {
             val instance = TaskInstance(
                 taskInstanceId = "$runId-${taskSpec.taskId}-1",
                 runId = runId,
                 jobId = jobId,
                 taskId = taskSpec.taskId,
-                status = TaskStatus.WAITING_DEPENDENCIES,
+                status = TaskStatus.QUEUED,
                 attempt = 1,
                 maxRetries = taskSpec.maxRetries,
                 action = taskSpec.action,
@@ -306,15 +333,7 @@ class SchedulerApiServer(
                 fencingToken = fencingToken
             )
             storage.saveTaskInstance(instance)
-            initialInstances[taskSpec.taskId] = instance
-        }
-
-        val readyTasks = DAGEngine.findReadyTasks(job.tasks, initialInstances)
-        for (task in readyTasks) {
-            val inst = initialInstances[task.taskId]!!
-            val queuedInst = inst.copy(status = TaskStatus.QUEUED)
-            storage.saveTaskInstance(queuedInst)
-            taskQueue.enqueue(queuedInst)
+            taskQueue.enqueue(instance)
         }
 
         return run

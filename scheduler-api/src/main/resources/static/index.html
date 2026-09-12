@@ -43,7 +43,6 @@
         .status-QUEUED, .status-READY { background: rgba(210, 153, 34, 0.15); color: var(--accent-amber); }
         .status-FAILED, .status-DEAD { background: rgba(248, 81, 73, 0.15); color: var(--accent-red); }
         .status-DEAD_LETTER { background: rgba(188, 140, 255, 0.15); color: var(--accent-purple); }
-        .status-WAITING_DEPENDENCIES { background: rgba(139, 148, 158, 0.15); color: var(--text-secondary); }
 
         button { background: var(--accent-blue); color: #fff; border: none; padding: 7px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; transition: opacity 0.2s; }
         button:hover { opacity: 0.85; }
@@ -51,10 +50,9 @@
         button.btn-amber { background: var(--accent-amber); color: #000; }
         button.btn-sm { padding: 4px 8px; font-size: 12px; }
 
-        .dag-node-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
-        .dag-node { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-size: 12px; }
-        .dag-node .name { font-weight: 600; font-family: 'JetBrains Mono', monospace; }
-        .dag-node .deps { color: var(--text-secondary); font-size: 11px; }
+        .task-node-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+        .task-node { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-size: 12px; }
+        .task-node .name { font-weight: 600; font-family: 'JetBrains Mono', monospace; }
 
         pre { font-family: 'JetBrains Mono', monospace; font-size: 12px; background: var(--bg-input); padding: 8px; border-radius: 4px; overflow-x: auto; color: #79c0ff; }
     </style>
@@ -64,7 +62,7 @@
         <header>
             <div>
                 <h1>⚙️ Distributed Job Scheduler</h1>
-                <p style="color: var(--text-secondary); font-size: 13px; margin-top: 4px;">Coordinator-Worker Cluster Architecture with Leased Leader Election & DAG Engine</p>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-top: 4px;">Coordinator-Worker Cluster Architecture with Leased Leader Election & Distributed Task Execution</p>
             </div>
             <div style="display: flex; gap: 10px; align-items: center;">
                 <span id="leaderStatus" class="badge-leader">Leader: active-master</span>
@@ -114,7 +112,7 @@
 
         <div class="section-header">
             <h2>Job Definitions</h2>
-            <button onclick="triggerSampleDag()" class="btn-sm">+ Trigger Sample ETL DAG</button>
+            <button onclick="triggerSampleJob()" class="btn-sm">+ Trigger Sample Job</button>
         </div>
         <div class="card" style="padding: 0; overflow-x: auto;">
             <table>
@@ -123,7 +121,7 @@
                         <th>Job ID</th>
                         <th>Name</th>
                         <th>Schedule</th>
-                        <th>Tasks (DAG)</th>
+                        <th>Tasks</th>
                         <th>Action</th>
                     </tr>
                 </thead>
@@ -132,7 +130,7 @@
         </div>
 
         <div class="section-header">
-            <h2>Recent Job Runs & DAG Progress</h2>
+            <h2>Recent Job Runs & Task Progress</h2>
         </div>
         <div class="card" style="padding: 0; overflow-x: auto;">
             <table>
@@ -143,7 +141,7 @@
                         <th>Status</th>
                         <th>Trigger Source</th>
                         <th>Triggered At</th>
-                        <th>DAG Task Instances</th>
+                        <th>Task Instances</th>
                     </tr>
                 </thead>
                 <tbody id="runsBody"><tr><td colspan="6" style="text-align:center;">Loading runs...</td></tr></tbody>
@@ -243,13 +241,13 @@
             }
             tbody.innerHTML = jobs.map(j => {
                 const sched = typeof j.schedule === 'object' ? JSON.stringify(j.schedule) : j.schedule;
-                const dagList = j.tasks.map(t => `<span class="dag-node"><span class="name">${t.taskId}</span> ${t.dependencies.length > 0 ? '<span class="deps">← [' + t.dependencies.join(',') + ']</span>' : ''}</span>`).join(' ');
+                const taskList = j.tasks.map(t => `<span class="task-node"><span class="name">${t.taskId}</span>: ${t.name}</span>`).join(' ');
                 return `
                     <tr>
                         <td><code>${j.jobId}</code></td>
                         <td><strong>${j.name}</strong></td>
                         <td><code>${sched}</code></td>
-                        <td><div class="dag-node-list">${dagList}</div></td>
+                        <td><div class="task-node-list">${taskList}</div></td>
                         <td><button onclick="triggerJob('${j.jobId}')" class="btn-sm">Trigger Run</button></td>
                     </tr>
                 `;
@@ -265,7 +263,7 @@
             tbody.innerHTML = runs.map(r => {
                 const date = new Date(r.triggeredAtEpochMs).toLocaleTimeString();
                 const taskBadges = (r.taskInstances || []).map(t => 
-                    `<span class="dag-node">
+                    `<span class="task-node">
                         <span class="name">${t.taskId}</span>: 
                         <span class="status-badge status-${t.status}">${t.status}</span>
                         ${t.output ? '<br/><small>' + t.output + '</small>' : ''}
@@ -280,7 +278,7 @@
                         <td><span class="status-badge status-${r.status}">${r.status}</span></td>
                         <td>${r.triggerSource}</td>
                         <td>${date}</td>
-                        <td><div class="dag-node-list">${taskBadges || 'No tasks created'}</div></td>
+                        <td><div class="task-node-list">${taskBadges || 'No tasks created'}</div></td>
                     </tr>
                 `;
             }).join('');
@@ -319,8 +317,8 @@
             setTimeout(refreshData, 500);
         }
 
-        async function triggerSampleDag() {
-            await fetch('/api/samples/dag', { method: 'POST' });
+        async function triggerSampleJob() {
+            await fetch('/api/samples/job', { method: 'POST' });
             setTimeout(refreshData, 300);
         }
 

@@ -16,7 +16,7 @@ import kotlin.test.assertTrue
 class EndToEndSchedulerTest {
 
     @Test
-    fun `test DAG workflow end-to-end execution`() = runBlocking {
+    fun `test multi-task job end-to-end execution`() = runBlocking {
         val storage = InMemorySchedulerStorage()
         val leaseStore = InMemoryLeaseStore()
         val taskQueue = InMemoryTaskQueue()
@@ -46,20 +46,20 @@ class EndToEndSchedulerTest {
         delay(1000)
         assertTrue(coordinator.isLeader())
 
-        // Create DAG: A -> B -> C
+        // Create multi-task job: A, B, C executed in parallel
         val job = JobSpec(
-            jobId = "test-dag",
-            name = "Test Sequential DAG",
+            jobId = "test-parallel-job",
+            name = "Test Parallel Multi-Task Job",
             schedule = ScheduleSpec.Immediate,
             tasks = listOf(
-                TaskSpec("task-A", "Step A", dependencies = emptySet(), action = TaskAction.Shell("echo A")),
-                TaskSpec("task-B", "Step B", dependencies = setOf("task-A"), action = TaskAction.Shell("echo B")),
-                TaskSpec("task-C", "Step C", dependencies = setOf("task-B"), action = TaskAction.Shell("echo C"))
+                TaskSpec("task-A", "Step A", action = TaskAction.Shell("echo A")),
+                TaskSpec("task-B", "Step B", action = TaskAction.Shell("echo B")),
+                TaskSpec("task-C", "Step C", action = TaskAction.Shell("echo C"))
             )
         )
         storage.saveJob(job)
 
-        val run = coordinator.triggerJob("test-dag", triggerSource = "TEST")
+        val run = coordinator.triggerJob("test-parallel-job", triggerSource = "TEST")
         assertNotNull(run)
 
         // Poll until completion or timeout (max 10 seconds)
@@ -77,15 +77,7 @@ class EndToEndSchedulerTest {
 
         val taskInstances = storage.getTaskInstancesForRun(run.runId)
         assertEquals(3, taskInstances.size)
-        assertTrue(taskInstances.all { it.status == TaskStatus.COMPLETED }, "All DAG task instances should be COMPLETED")
-
-        // Verify ordering of execution
-        val instA = taskInstances.first { it.taskId == "task-A" }
-        val instB = taskInstances.first { it.taskId == "task-B" }
-        val instC = taskInstances.first { it.taskId == "task-C" }
-
-        assertTrue(instA.completedAtEpochMs!! <= instB.startedAtEpochMs!!, "Task A should complete before Task B starts")
-        assertTrue(instB.completedAtEpochMs!! <= instC.startedAtEpochMs!!, "Task B should complete before Task C starts")
+        assertTrue(taskInstances.all { it.status == TaskStatus.COMPLETED }, "All task instances should be COMPLETED")
 
         worker.stop()
         coordinator.stop()
@@ -191,7 +183,7 @@ class EndToEndSchedulerTest {
             name = "Decoupled Architecture Test",
             schedule = ScheduleSpec.Immediate,
             tasks = listOf(
-                TaskSpec("step-1", "Echo Hello", dependencies = emptySet(), action = TaskAction.Shell("echo hello"))
+                TaskSpec("step-1", "Echo Hello", action = TaskAction.Shell("echo hello"))
             )
         )
         apiMetadataStore.saveJob(job)

@@ -50,7 +50,6 @@ sealed interface TaskAction {
 data class TaskSpec(
     val taskId: String,
     val name: String,
-    val dependencies: Set<String> = emptySet(),
     val action: TaskAction,
     val timeoutMs: Long = 30_000,
     val maxRetries: Int = 3,
@@ -78,8 +77,6 @@ enum class JobStatus {
 
 @Serializable
 enum class TaskStatus {
-    WAITING_DEPENDENCIES,
-    READY,
     QUEUED,
     RUNNING,
     COMPLETED,
@@ -107,7 +104,7 @@ data class TaskInstance(
     val runId: String,
     val jobId: String,
     val taskId: String,
-    val status: TaskStatus = TaskStatus.WAITING_DEPENDENCIES,
+    val status: TaskStatus = TaskStatus.QUEUED,
     val attempt: Int = 1,
     val maxRetries: Int = 3,
     val action: TaskAction,

@@ -17,10 +17,10 @@ class DatabasePerMicroserviceTest {
 
         val job = JobSpec(
             jobId = "job-invoice-generation",
-            name = "Invoice Generation DAG",
+            name = "Invoice Generation Job",
             schedule = ScheduleSpec.Cron("0 0 * * *"),
             tasks = listOf(
-                TaskSpec("t1", "Fetch Orders", dependencies = emptySet(), action = TaskAction.Shell("echo fetch"))
+                TaskSpec("t1", "Fetch Orders", action = TaskAction.Shell("echo fetch"))
             )
         )
 
@@ -28,7 +28,7 @@ class DatabasePerMicroserviceTest {
         jobStore.saveJob(job)
         val loaded = jobStore.getJob("job-invoice-generation")
         assertNotNull(loaded)
-        assertEquals("Invoice Generation DAG", loaded.name)
+        assertEquals("Invoice Generation Job", loaded.name)
         assertEquals(1, loaded.tasks.size)
 
         // 2. List jobs
@@ -135,7 +135,7 @@ class DatabasePerMicroserviceTest {
             jobId = "composite-job",
             name = "Composite Test",
             schedule = ScheduleSpec.Immediate,
-            tasks = listOf(TaskSpec("t1", "Step 1", dependencies = emptySet(), action = TaskAction.Shell("echo 1")))
+            tasks = listOf(TaskSpec("t1", "Step 1", action = TaskAction.Shell("echo 1")))
         )
         composite.saveJob(job)
         assertNotNull(jobStore.getJob("composite-job"))
