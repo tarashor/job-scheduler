@@ -26,8 +26,16 @@ class RedisStorage(private val pool: JedisPool) : SchedulerStorage, LeaseStore, 
     private val keyRuns = "scheduler:runs"
     private val keyTaskInstances = "scheduler:instances"
     private val keyWorkers = "scheduler:workers"
-    private val keyQueue = "scheduler:queue:ready"
+    private val numShards = 16
+    private val keyQueuePrefix = "scheduler:queue:ready"
+    private val queueRoundRobin = java.util.concurrent.atomic.AtomicInteger(0)
     private val keyDlq = "scheduler:queue:dlq"
+    private val keyOutbox = "scheduler:outbox"
+
+    private fun getShardKey(taskInstanceId: String): String {
+        val shardId = (taskInstanceId.hashCode() and 0x7FFFFFFF) % numShards
+        return "$keyQueuePrefix:$shardId"
+    }
 
     // --- LEASE STORE (Leader Election) ---
     override fun getCurrentLease(): LeaderLease? {
@@ -48,9 +56,9 @@ class RedisStorage(private val pool: JedisPool) : SchedulerStorage, LeaseStore, 
                 expiresAtEpochMs = now + durationMs
             )
             val payload = json.encodeToString(lease)
-            val params = SetParams().nx().px(durationMs)
+            val params = redis.clients.jedis.params.SetParams().nx().px(durationMs)
             val res = jedis.set(keyLeaderLease, payload, params)
-            return if ("OK" == res) lease else null
+            return if (res == "OK") lease else null
         }
     }
 
@@ -60,9 +68,9 @@ class RedisStorage(private val pool: JedisPool) : SchedulerStorage, LeaseStore, 
             if (current != null && current.leaderId == nodeId && current.fencingToken == fencingToken) {
                 val now = System.currentTimeMillis()
                 val renewed = current.copy(expiresAtEpochMs = now + durationMs)
-                val params = SetParams().xx().px(durationMs)
+                val params = redis.clients.jedis.params.SetParams().xx().px(durationMs)
                 val res = jedis.set(keyLeaderLease, json.encodeToString(renewed), params)
-                return if ("OK" == res) renewed else null
+                return if (res == "OK") renewed else null
             }
             return null
         }
@@ -83,26 +91,31 @@ class RedisStorage(private val pool: JedisPool) : SchedulerStorage, LeaseStore, 
     override suspend fun enqueue(task: TaskInstance): Unit = withContext(Dispatchers.IO) {
         val queued = task.copy(status = TaskStatus.QUEUED)
         val payload = json.encodeToString(queued)
+        val shardKey = getShardKey(queued.taskInstanceId)
         pool.resource.use { jedis ->
             // Score is scheduledAtEpochMs
-            jedis.zadd(keyQueue, queued.scheduledAtEpochMs.toDouble(), payload)
+            jedis.zadd(shardKey, queued.scheduledAtEpochMs.toDouble(), payload)
         }
-        logger.info("Redis: Enqueued task '${task.taskInstanceId}' scheduled for ${task.scheduledAtEpochMs}ms")
+        logger.info("Redis: Enqueued task '${task.taskInstanceId}' to shard '$shardKey' scheduled for ${task.scheduledAtEpochMs}ms")
     }
 
-    override suspend fun poll(maxWaitMs: Long): TaskInstance? = withContext(Dispatchers.IO) {
+    override suspend fun poll(lookaheadMs: Long, maxWaitMs: Long): TaskInstance? = withContext(Dispatchers.IO) {
         val deadline = System.currentTimeMillis() + maxWaitMs
         while (System.currentTimeMillis() <= deadline) {
             val now = System.currentTimeMillis()
+            val threshold = (now + lookaheadMs).toDouble()
+            val startIdx = (queueRoundRobin.getAndIncrement() and 0x7FFFFFFF) % numShards
+
             pool.resource.use { jedis ->
-                // Pop earliest task where scheduledAt <= now
-                val items = jedis.zrangeByScore(keyQueue, 0.0, now.toDouble(), 0, 1)
-                if (items.isNotEmpty()) {
-                    val raw = items.first()
-                    // Atomic remove
-                    val removed = jedis.zrem(keyQueue, raw)
-                    if (removed > 0) {
-                        return@withContext json.decodeFromString<TaskInstance>(raw)
+                for (i in 0 until numShards) {
+                    val shardKey = "$keyQueuePrefix:${(startIdx + i) % numShards}"
+                    val items = jedis.zrangeByScore(shardKey, 0.0, threshold, 0, 1)
+                    if (items.isNotEmpty()) {
+                        val raw = items.first()
+                        val removed = jedis.zrem(shardKey, raw)
+                        if (removed > 0) {
+                            return@withContext json.decodeFromString<TaskInstance>(raw)
+                        }
                     }
                 }
             }
@@ -177,7 +190,13 @@ class RedisStorage(private val pool: JedisPool) : SchedulerStorage, LeaseStore, 
     }
 
     override suspend fun queueSize(): Int = withContext(Dispatchers.IO) {
-        pool.resource.use { it.zcard(keyQueue).toInt() }
+        pool.resource.use { jedis ->
+            var total = 0
+            for (i in 0 until numShards) {
+                total += jedis.zcard("$keyQueuePrefix:$i").toInt()
+            }
+            total
+        }
     }
 
     override suspend fun dlqSize(): Int = withContext(Dispatchers.IO) {
@@ -270,6 +289,30 @@ class RedisStorage(private val pool: JedisPool) : SchedulerStorage, LeaseStore, 
             return it.hgetAll(keyWorkers).values
                 .map { raw -> json.decodeFromString<WorkerInfo>(raw) }
                 .sortedBy { w -> w.workerId }
+        }
+    }
+
+    // --- OUTBOX STORE ---
+    override fun saveOutboxEvent(event: OutboxEvent) {
+        pool.resource.use { it.hset(keyOutbox, event.eventId, json.encodeToString(event)) }
+    }
+
+    override fun fetchPendingOutboxEvents(limit: Int): List<OutboxEvent> {
+        return pool.resource.use { jedis ->
+            jedis.hgetAll(keyOutbox).values
+                .map { json.decodeFromString<OutboxEvent>(it) }
+                .filter { it.status == OutboxStatus.PENDING }
+                .sortedBy { it.createdAtEpochMs }
+                .take(limit)
+        }
+    }
+
+    override fun markOutboxDispatched(eventId: String, dispatchedAtEpochMs: Long) {
+        pool.resource.use { jedis ->
+            val raw = jedis.hget(keyOutbox, eventId) ?: return
+            val current = json.decodeFromString<OutboxEvent>(raw)
+            val updated = current.copy(status = OutboxStatus.DISPATCHED, dispatchedAtEpochMs = dispatchedAtEpochMs)
+            jedis.hset(keyOutbox, eventId, json.encodeToString(updated))
         }
     }
 }

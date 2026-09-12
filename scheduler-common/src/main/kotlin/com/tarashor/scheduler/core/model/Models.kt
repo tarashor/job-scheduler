@@ -176,3 +176,21 @@ data class HeartbeatResponse(
     val leaderId: String,
     val fencingToken: Long
 )
+
+@Serializable
+enum class OutboxStatus {
+    PENDING,
+    DISPATCHED,
+    FAILED
+}
+
+@Serializable
+data class OutboxEvent(
+    val eventId: String,
+    val aggregateType: String = "TASK_INSTANCE",
+    val aggregateId: String,
+    val taskInstance: TaskInstance,
+    val status: OutboxStatus = OutboxStatus.PENDING,
+    val createdAtEpochMs: Long = System.currentTimeMillis(),
+    val dispatchedAtEpochMs: Long? = null
+)

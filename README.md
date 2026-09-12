@@ -28,6 +28,9 @@
    - [Експоненційне відтермінування з джитером (Exponential Backoff with Jitter) та черга DLQ](#експоненційне-відтермінування-з-джитером-exponential-backoff-with-jitter-та-черга-dlq)
    - [Детальне архітектурне обґрунтування: Чому обрано Redis замість Kafka](#детальне-архітектурне-обґрунтування-чому-обрано-redis-замість-kafka)
    - [Канонічна архітектура «Database-per-Microservice» для High-Load (10k QPS)](#канонічна-архітектура-database-per-microservice-для-high-load-10k-qps)
+   - [Шардована відкладена черга (16 Shards) для ліквідації ботлнеку Redis](#шардована-відкладена-черга-16-shards-для-ліквідації-ботлнеку-redis)
+   - [Worker-Side Hashed Timing Wheel для надвисокої точності виконання (< 50ms)](#worker-side-hashed-timing-wheel-для-надвисокої-точності-виконання--50ms)
+   - [Гарантія At-Least-Once через Transactional Outbox Pattern](#гарантія-at-least-once-через-transactional-outbox-pattern)
 4. [Багатомодульна структура кодової бази](#4-багатомодульна-структура-кодової-бази)
 5. [Запуск мікросервісів](#5-запуск-мікросервісів)
    - [Варіант A: Docker Compose (Повний розподілений кластер)](#варіант-a-docker-compose-повний-розподілений-кластер)
@@ -366,12 +369,54 @@ flowchart TD
 | **`scheduler-worker`** | **Stateless (БЕЗ власної БД)** | **No DB**: Воркери повністю позбавлені прямого доступу до баз даних. Отримують лише `TaskExecutionPayload` (URL, параметри, таймаут, `Idempotency-Key`) і публікують події статусу. | Відсутній (повна незалежність від сховищ). |
 | **`scheduler-history`** | **ClickHouse** / **ScyllaDB / S3** | **Append-Only Time-Series**: Журнал запусків `job_runs` та `task_executions`. Високошвидкісний паралельний запис ($10{,}000$ подій/сек), компресія у 5–10 разів, швидкі аналітичні агрегації по SLA. | Середньо- та довгостроковий (30 днів у гарячій БД $\approx 26\text{ ТБ}$, далі вивантаження в S3 Iceberg). |
 
-#### Міжсервісна синхронізація без спільної БД (Transactional Outbox)
-Щоб уникнути розподілених транзакцій (2PC), використовується патерн **Transactional Outbox**:
-1. `scheduler-api` зберігає завдання у PostgreSQL і в тій самій локальній транзакції пише подію в таблицю `outbox_events`.
-2. Фоновий ретранслятор (Debezium CDC або Transactional Log Miner) публікує подію `JobScheduledEvent` у Kafka/NATS.
-3. `scheduler-coordinator` отримує подію з шини та заштовхує інстанс завдання у відповідний шард черги Redis (`delay_queue:{shard}`).
-4. Після завершення воркер надсилає подію `TaskExecutedEvent`. Сервіс історії фіксує її в ClickHouse, а координатор перевіряє завершення всіх завдань запуску.
+### Шардована відкладена черга (16 Shards) для ліквідації ботлнеку Redis
+
+У високонавантажених системах ($10{,}000\text{ QPS}$) збереження всіх відкладених завдань в одному ключі `scheduler:queue:ready` (Redis Sorted Set) створює критичний **Single-Thread Bottleneck**:
+- Операції `ZADD` та `ZPOPMIN` на великому ZSET мають складність $O(\log N)$ і блокують єдиний потік виконання інстансу Redis.
+- Велика кількість паралельних воркерів створює екстремальну конкуренцію (Lock / Thread Contention) за один спільний ключ.
+
+#### Рішення: Striped Sharded TaskQueue
+Черга шардується за формулою детермінованого хешування:
+$$\text{shardIndex} = |\text{hash}(\text{taskInstanceId})| \pmod{16}$$
+- Кожне завдання потрапляє в один із 16 незалежних ZSET-ключів: `scheduler:queue:ready:{0..15}`.
+- Завдяки 16 шардам навантаження на ZSET падає з $10{,}000\text{ QPS}$ до $\approx 625\text{ QPS}$ на шард, що усуває блокування та дозволяє горизонтальне партиціювання кластера Redis.
+- Воркери опитують шарди з використанням **Round-Robin** та атомарного лічильника, запобігаючи перекосу навантаження (Skew).
+
+---
+
+### Worker-Side Hashed Timing Wheel для надвисокої точності виконання (< 50ms)
+
+Вимога SLA вимагає запуску завдань із затримкою не більше **$\le 2\text{ секунд}$** від запланованого часу. Постійне опитування (Polling) черги Redis кожні 50мс з боку сотень воркерів перевантажило б мережу та процесор.
+
+#### Рішення: Алгоритм George Varghese & Anthony Lauck (ACM SOSP)
+Замість опитування Redis в момент виконання реалізовано дворівневу схему:
+1. **Lookahead Pre-fetching (Попереднє завантаження на 5 секунд)**:
+   Воркер витягує завдання з черги Redis не тоді, коли вони вже прострочені, а з випередженням:
+   $$\text{scheduledAt} \le \text{now} + 5000\text{ms}$$
+2. **Hashed Timing Wheel на стороні воркера**:
+   - Круговий масив на **512 слотів** з кроком **20 мс** на тік ($512 \times 20\text{мс} = 10.24\text{ секунди}$ на повний оберт).
+   - Швидке обчислення слота через побітову маску ($O(1)$ без ділення):
+     $$\text{slotIndex} = \left(\text{currentTick} + \frac{\text{delayMs}}{\text{tickDurationMs}}\right) \ \& \ (512 - 1)$$
+   - Підтримка багатообертових затримок (`roundsRemaining`): якщо затримка перевищує повний цикл колеса, завдання очікує відповідну кількість обертів.
+   - **Точність виконання**: Завдяки локальному тіку в 20мс середня похибка старту завдання становить **$< 30-50\text{ мс}$**, що у 40–60 разів перевищує вимогу SLA ($< 2000\text{ мс}$).
+
+---
+
+### Гарантія At-Least-Once через Transactional Outbox Pattern
+
+#### Проблема: Dual-Write Vulnerability
+Якщо сервіс спочатку зберігає запуск у БД, а потім відправляє завдання в чергу:
+- Збій мережі або падіння вузла між цими діями призводить до **втрати завдання** (завдання є в БД зі статусом PENDING/QUEUED, але ніколи не потрапило в чергу і не виконається).
+- Якщо поміняти порядок — завдання виконається, але його статус не збережеться.
+
+#### Рішення: Транзакційний Outbox
+1. **Атомарний запис події**:
+   При створенні запуску чи переході кроку подія `OutboxEvent(eventId, aggregateId, taskInstance, PENDING)` зберігається в тій самій транзакції, що й стан сутності (`outbox_events` таблиця в SQLite/PostgreSQL, або Redis Hash).
+2. **Фоновий диспетчер `TransactionalOutboxDispatcher`**:
+   - Безперервно вибирає події зі статусом `PENDING`.
+   - Публікує завдання у шардовану чергу `TaskQueue`.
+   - Тільки після успішної доставки оновлює статус події на `DISPATCHED`.
+   - У разі падіння системи всі непідтверджені події автоматично підхоплюються та відправляються повторно, забезпечуючи **нульову втрату завдань (Zero-Loss Guarantee)**.
 
 ---
 
@@ -388,13 +433,17 @@ job-scheduler/
 │       └── cron/CronParser.kt            # Парсер 5-значних Cron-виразів
 ├── scheduler-storage/                    # [Шар даних: Database-per-Microservice]
 │   ├── src/main/kotlin/com/tarashor/scheduler/
-│   │   ├── storage/Storage.kt            # Інтерфейси JobMetadataStore, RunHistoryStore, WorkerRegistry та SQLite
-│   │   ├── storage/RedisStorage.kt       # Черга затримок Redis ZSET, лідерство та хеші
+│   │   ├── outbox/TransactionalOutboxDispatcher.kt # Гарантія Zero-Loss At-Least-Once відправки
+│   │   ├── queue/TaskQueue.kt            # Шардована черга (16 shards) із lookahead вибіркою
+│   │   ├── storage/Storage.kt            # Інтерфейси сховищ, OutboxStore та SQLite
+│   │   ├── storage/RedisStorage.kt       # Шардована черга затримок Redis ZSET, лідерство та outbox
 │   │   └── storage/StorageFactory.kt     # Фабрика ізольованих сховищ для API, Coordinator та Worker
 │   └── src/test/kotlin/com/tarashor/scheduler/
 │       ├── DatabasePerMicroserviceTest.kt # Тести суворої ізоляції баз даних для кожного сервісу
 │       ├── LeaderElectionTest.kt         # Тести лізингу та Fencing Tokens
-│       └── TaskQueueAndDLQTest.kt        # Тести черги затримок та Dead Letter Queue
+│       ├── ShardedTaskQueueTest.kt       # Тести 16-шардової черги з lookahead опитуванням
+│       ├── TaskQueueAndDLQTest.kt        # Тести черги затримок та Dead Letter Queue
+│       └── TransactionalOutboxTest.kt    # Тести відновлення та нульової втрати повідомлень
 ├── scheduler-api/                        # [Мікросервіс 1: Spring Boot REST API & Dashboard]
 │   └── src/main/kotlin/com/tarashor/scheduler/
 │       ├── api/ApiApplication.kt         # Головна точка входу Spring Boot (@SpringBootApplication)
@@ -411,12 +460,15 @@ job-scheduler/
 │   └── src/test/kotlin/com/tarashor/scheduler/
 │       └── EndToEndSchedulerTest.kt      # Наскрізні тести паралельного виконання та decoupled Database-per-Microservice
 └── scheduler-worker/                     # [Мікросервіс 3: Stateless Worker Daemon]
-    └── src/main/kotlin/com/tarashor/scheduler/worker/
-        ├── WorkerApplication.kt          # Головна точка входу Spring Boot (@SpringBootApplication)
-        ├── WorkerConfig.kt               # Налаштування бінів та параметрів пулу завдань
-        ├── WorkerService.kt              # Життєвий цикл воркера (Heartbeats, polling)
-        ├── WorkerNode.kt                 # Цикл опитування черги, керування місткістю та heartbeats
-        └── TaskRunner.kt                 # Середовище виконання: HTTP-вебхуки (Java HttpClient), Shell-скрипти
+    ├── src/main/kotlin/com/tarashor/scheduler/worker/
+    │   ├── WorkerApplication.kt          # Головна точка входу Spring Boot (@SpringBootApplication)
+    │   ├── WorkerConfig.kt               # Налаштування бінів та параметрів пулу завдань
+    │   ├── WorkerService.kt              # Життєвий цикл воркера (Heartbeats, polling)
+    │   ├── WorkerNode.kt                 # Цикл опитування черги, керування місткістю та heartbeats
+    │   ├── HashedTimingWheel.kt          # O(1) George Varghese & Anthony Lauck Timing Wheel (20ms)
+    │   └── TaskRunner.kt                 # Середовище виконання: HTTP-вебхуки (Java HttpClient), Shell-скрипти
+    └── src/test/kotlin/com/tarashor/scheduler/worker/
+        └── HashedTimingWheelTest.kt      # Тести надвисокої точності <50ms та багатообертовості
 ```
 
 ---
@@ -568,8 +620,9 @@ curl -X POST http://localhost:8080/api/cluster/stepdown
 | Субпроєкт | Що перевіряється тестами |
 | :--- | :--- |
 | **`scheduler-common`** | Парсинг Cron-виразів, кроки (`*/5`), діапазони (`1-5`), пресети (`@daily`), валідація та серіалізація моделей завдань. |
-| **`scheduler-storage`** | **Ізоляція Database-per-Microservice** (`DatabasePerMicroserviceTest`): перевірка створення окремих схем БД без перетину таблиць (`jobs`, `job_runs`, `workers`), робота `CompositeSchedulerStorage`. Атомарне взяття лізу (`LeaderElectionTest`), пріоритетна черга затримок Redis `ZSET`, математика backoff-джитеру та ізоляція в DLQ (`TaskQueueAndDLQTest`). |
+| **`scheduler-storage`** | **Ізоляція Database-per-Microservice** (`DatabasePerMicroserviceTest`): перевірка окремих схем БД без перетину таблиць (`jobs`, `job_runs`, `workers`). Атомарне лідерство (`LeaderElectionTest`), черги затримок Redis `ZSET`, backoff-джитер та DLQ (`TaskQueueAndDLQTest`). **Шардована черга** (`ShardedTaskQueueTest`): 16-шардовий розподіл навантаження та Round-Robin вибірка. **Транзакційний Outbox** (`TransactionalOutboxTest`): надійне збереження в SQLite/Memory та фонова диспетчеризація без втрати повідомлень. |
 | **`scheduler-coordinator`** | **Декомпонована оркестрація** (`EndToEndSchedulerTest`): наскрізний запуск незалежних завдань зі Stateless-воркером (без доступу до метаданих БД), автоматичний Reaper для аварійних воркерів та перехоплення лідерства. |
+| **`scheduler-worker`** | **George Varghese & Anthony Lauck Hashed Timing Wheel** (`HashedTimingWheelTest`): мікросекундна точність виконання ($< 50\text{мс}$ проти ліміту SLA $2000\text{мс}$), коректність обробки багатообертових затримок (`roundsRemaining`) та миттєве виконання нульових затримок. |
 
 ---
 

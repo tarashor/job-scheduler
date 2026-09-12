@@ -218,8 +218,15 @@ class ApiController(
                 scheduledAtEpochMs = now,
                 fencingToken = fencingToken
             )
+            val outboxEvent = OutboxEvent(
+                eventId = UUID.randomUUID().toString(),
+                aggregateId = instance.taskInstanceId,
+                taskInstance = instance
+            )
             storage.saveTaskInstance(instance)
+            storage.saveOutboxEvent(outboxEvent)
             taskQueue.enqueue(instance)
+            storage.markOutboxDispatched(outboxEvent.eventId)
         }
 
         return run

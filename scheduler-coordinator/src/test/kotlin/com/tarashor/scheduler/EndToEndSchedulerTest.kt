@@ -89,17 +89,6 @@ class EndToEndSchedulerTest {
         val leaseStore = InMemoryLeaseStore()
         val taskQueue = InMemoryTaskQueue()
 
-        val coordinator = SchedulerCoordinator(
-            coordinatorId = "master-reaper",
-            leaseStore = leaseStore,
-            storage = storage,
-            taskQueue = taskQueue,
-            tickIntervalMs = 300,
-            workerHeartbeatTimeoutMs = 1000 // Short heartbeat timeout for test
-        )
-        coordinator.start()
-        delay(600)
-
         // Register a worker with a task, then simulate it crashing by stopping heartbeats
         val deadWorkerInfo = WorkerInfo(
             workerId = "crashed-worker",
@@ -122,16 +111,36 @@ class EndToEndSchedulerTest {
         )
         storage.saveTaskInstance(stuckTask)
 
-        // Wait for coordinator tick to reap the dead worker
-        delay(1200)
+        val coordinator = SchedulerCoordinator(
+            coordinatorId = "master-reaper",
+            leaseStore = leaseStore,
+            storage = storage,
+            taskQueue = taskQueue,
+            tickIntervalMs = 200,
+            workerHeartbeatTimeoutMs = 1000 // Short heartbeat timeout for test
+        )
+        coordinator.start()
+
+        // Wait for coordinator tick to reap the dead worker and reclaim its tasks
+        var taskReclaimed = false
+        for (i in 1..40) {
+            val w = storage.getWorker("crashed-worker")
+            val t = storage.getTaskInstance("run-x-task-1-1")
+            if (w?.status == WorkerStatus.DEAD && t?.status == TaskStatus.RETRYING) {
+                taskReclaimed = true
+                break
+            }
+            delay(100)
+        }
+        assertTrue(taskReclaimed, "Worker should be marked DEAD and task should have been reclaimed to RETRYING")
 
         val updatedWorker = storage.getWorker("crashed-worker")
         assertNotNull(updatedWorker)
-        assertEquals(WorkerStatus.DEAD, updatedWorker.status, "Worker should be marked DEAD")
+        assertEquals(WorkerStatus.DEAD, updatedWorker.status)
 
         val updatedTask = storage.getTaskInstance("run-x-task-1-1")
         assertNotNull(updatedTask)
-        assertEquals(TaskStatus.RETRYING, updatedTask.status, "Task should have been reclaimed and set to RETRYING")
+        assertEquals(TaskStatus.RETRYING, updatedTask.status)
 
         coordinator.stop()
     }
@@ -194,7 +203,16 @@ class EndToEndSchedulerTest {
         val runId = triggeredRun.runId
 
         // Wait for execution
-        delay(1200)
+        var runCompleted = false
+        for (i in 1..30) {
+            val r = historyStore.getRun(runId)
+            if (r?.status == JobStatus.COMPLETED) {
+                runCompleted = true
+                break
+            }
+            delay(100)
+        }
+        assertTrue(runCompleted, "Run should reach COMPLETED status")
 
         // Verify status in HistoryStore
         val run = historyStore.getRun(runId)

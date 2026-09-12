@@ -19,6 +19,8 @@ class WorkerNode(
     private val runHistoryStore: RunHistoryStore? = null,
     private val taskRunner: TaskRunner = DefaultTaskRunner(),
     private val heartbeatIntervalMs: Long = 2_000,
+    val prefetchLookaheadMs: Long = 5_000,
+    val timingWheel: HashedTimingWheel = HashedTimingWheel(tickDurationMs = 20L),
     private val onTaskCompleted: (suspend (TaskInstance, TaskExecutionResult) -> Unit)? = null
 ) {
     // Backward-compatible constructor for monolithic/composite storage
@@ -29,6 +31,7 @@ class WorkerNode(
         storage: SchedulerStorage,
         taskRunner: TaskRunner = DefaultTaskRunner(),
         heartbeatIntervalMs: Long = 2_000,
+        prefetchLookaheadMs: Long = 5_000,
         onTaskCompleted: (suspend (TaskInstance, TaskExecutionResult) -> Unit)? = null
     ) : this(
         workerId = workerId,
@@ -38,6 +41,8 @@ class WorkerNode(
         runHistoryStore = storage,
         taskRunner = taskRunner,
         heartbeatIntervalMs = heartbeatIntervalMs,
+        prefetchLookaheadMs = prefetchLookaheadMs,
+        timingWheel = HashedTimingWheel(tickDurationMs = 20L),
         onTaskCompleted = onTaskCompleted
     )
     private val logger = LoggerFactory.getLogger("Worker-$workerId")
@@ -48,7 +53,8 @@ class WorkerNode(
 
     fun start() {
         if (!isRunning.compareAndSet(false, true)) return
-        logger.info("Worker '$workerId' starting with capacity $capacity")
+        logger.info("Worker '$workerId' starting with capacity $capacity and HashedTimingWheel")
+        timingWheel.start()
 
         // 1. Heartbeat loop
         scope.launch {
@@ -88,13 +94,22 @@ class WorkerNode(
         while (isRunning.get()) {
             try {
                 if (currentLoad.get() >= capacity) {
-                    delay(100)
+                    delay(50)
                     continue
                 }
 
-                val task = taskQueue.poll(maxWaitMs = 1000)
+                val task = taskQueue.poll(lookaheadMs = prefetchLookaheadMs, maxWaitMs = 1000)
                 if (task != null) {
-                    processTask(task)
+                    val delayMs = task.scheduledAtEpochMs - System.currentTimeMillis()
+                    if (delayMs <= 0L) {
+                        processTask(task)
+                    } else {
+                        // Pre-reserve capacity slot and schedule into HashedTimingWheel
+                        currentLoad.incrementAndGet()
+                        timingWheel.schedule(task.taskInstanceId, task.scheduledAtEpochMs) {
+                            executeTaskCore(task)
+                        }
+                    }
                 }
             } catch (e: CancellationException) {
                 break
@@ -107,6 +122,10 @@ class WorkerNode(
 
     private suspend fun processTask(task: TaskInstance) {
         currentLoad.incrementAndGet()
+        executeTaskCore(task)
+    }
+
+    private suspend fun executeTaskCore(task: TaskInstance) {
         val runningTask = task.copy(
             status = TaskStatus.RUNNING,
             assignedWorkerId = workerId,
@@ -115,7 +134,7 @@ class WorkerNode(
         )
         activeTasks[runningTask.taskInstanceId] = runningTask
         runHistoryStore?.saveTaskInstance(runningTask)
-        logger.info("Worker '$workerId' picked up task '${runningTask.taskInstanceId}' (Attempt ${runningTask.attempt})")
+        logger.info("Worker '$workerId' executing task '${runningTask.taskInstanceId}' (Attempt ${runningTask.attempt})")
 
         try {
             val timeoutMs = 30_000L // Default timeout, can be customized per task
@@ -168,6 +187,7 @@ class WorkerNode(
                 activeTaskIds = emptySet()
             )
             workerRegistry.upsertWorker(deadInfo)
+            timingWheel.stop()
             scope.cancel()
         }
     }

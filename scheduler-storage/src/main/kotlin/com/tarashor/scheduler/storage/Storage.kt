@@ -37,16 +37,47 @@ interface WorkerRegistry {
     fun listWorkers(): List<WorkerInfo>
 }
 
-interface SchedulerStorage : JobMetadataStore, RunHistoryStore, WorkerRegistry
+interface OutboxStore {
+    fun saveOutboxEvent(event: OutboxEvent)
+    fun fetchPendingOutboxEvents(limit: Int = 100): List<OutboxEvent>
+    fun markOutboxDispatched(eventId: String, dispatchedAtEpochMs: Long = System.currentTimeMillis())
+}
+
+class InMemoryOutboxStore : OutboxStore {
+    private val events = ConcurrentHashMap<String, OutboxEvent>()
+
+    override fun saveOutboxEvent(event: OutboxEvent) {
+        events[event.eventId] = event
+    }
+
+    override fun fetchPendingOutboxEvents(limit: Int): List<OutboxEvent> {
+        return events.values
+            .filter { it.status == OutboxStatus.PENDING }
+            .sortedBy { it.createdAtEpochMs }
+            .take(limit)
+    }
+
+    override fun markOutboxDispatched(eventId: String, dispatchedAtEpochMs: Long) {
+        val current = events[eventId] ?: return
+        events[eventId] = current.copy(
+            status = OutboxStatus.DISPATCHED,
+            dispatchedAtEpochMs = dispatchedAtEpochMs
+        )
+    }
+}
+
+interface SchedulerStorage : JobMetadataStore, RunHistoryStore, WorkerRegistry, OutboxStore
 
 class CompositeSchedulerStorage(
     val jobMetadataStore: JobMetadataStore,
     val runHistoryStore: RunHistoryStore,
-    val workerRegistry: WorkerRegistry
+    val workerRegistry: WorkerRegistry,
+    val outboxStore: OutboxStore = InMemoryOutboxStore()
 ) : SchedulerStorage,
     JobMetadataStore by jobMetadataStore,
     RunHistoryStore by runHistoryStore,
-    WorkerRegistry by workerRegistry
+    WorkerRegistry by workerRegistry,
+    OutboxStore by outboxStore
 
 class InMemoryJobMetadataStore : JobMetadataStore {
     private val jobs = ConcurrentHashMap<String, JobSpec>()
@@ -120,6 +151,27 @@ class InMemorySchedulerStorage : SchedulerStorage {
 
     override fun getWorker(workerId: String): WorkerInfo? = workers[workerId]
     override fun listWorkers(): List<WorkerInfo> = workers.values.sortedBy { it.workerId }
+
+    private val outboxEvents = ConcurrentHashMap<String, OutboxEvent>()
+
+    override fun saveOutboxEvent(event: OutboxEvent) {
+        outboxEvents[event.eventId] = event
+    }
+
+    override fun fetchPendingOutboxEvents(limit: Int): List<OutboxEvent> {
+        return outboxEvents.values
+            .filter { it.status == OutboxStatus.PENDING }
+            .sortedBy { it.createdAtEpochMs }
+            .take(limit)
+    }
+
+    override fun markOutboxDispatched(eventId: String, dispatchedAtEpochMs: Long) {
+        val current = outboxEvents[eventId] ?: return
+        outboxEvents[eventId] = current.copy(
+            status = OutboxStatus.DISPATCHED,
+            dispatchedAtEpochMs = dispatchedAtEpochMs
+        )
+    }
 }
 
 class SqliteSchedulerStorage(private val dbPath: String = "scheduler.db") : SchedulerStorage {
@@ -177,6 +229,18 @@ class SqliteSchedulerStorage(private val dbPath: String = "scheduler.db") : Sche
                         worker_id TEXT PRIMARY KEY,
                         status TEXT NOT NULL,
                         last_heartbeat INTEGER NOT NULL,
+                        json_data TEXT NOT NULL
+                    );
+                    """.trimIndent()
+                )
+                stmt.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS outbox_events (
+                        event_id TEXT PRIMARY KEY,
+                        aggregate_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        dispatched_at INTEGER,
                         json_data TEXT NOT NULL
                     );
                     """.trimIndent()
@@ -376,6 +440,48 @@ class SqliteSchedulerStorage(private val dbPath: String = "scheduler.db") : Sche
             }
         }
         return list
+    }
+
+    override fun saveOutboxEvent(event: OutboxEvent) {
+        val payload = json.encodeToString(event)
+        getConnection().use { conn ->
+            conn.prepareStatement(
+                "INSERT INTO outbox_events(event_id, aggregate_id, status, created_at, dispatched_at, json_data) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET status=excluded.status, dispatched_at=excluded.dispatched_at, json_data=excluded.json_data"
+            ).use { stmt ->
+                stmt.setString(1, event.eventId)
+                stmt.setString(2, event.aggregateId)
+                stmt.setString(3, event.status.name)
+                stmt.setLong(4, event.createdAtEpochMs)
+                val dispatched = event.dispatchedAtEpochMs
+                if (dispatched != null) stmt.setLong(5, dispatched) else stmt.setNull(5, java.sql.Types.INTEGER)
+                stmt.setString(6, payload)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    override fun fetchPendingOutboxEvents(limit: Int): List<OutboxEvent> {
+        val list = mutableListOf<OutboxEvent>()
+        getConnection().use { conn ->
+            conn.prepareStatement("SELECT json_data FROM outbox_events WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT ?").use { stmt ->
+                stmt.setInt(1, limit)
+                val rs = stmt.executeQuery()
+                while (rs.next()) {
+                    list.add(json.decodeFromString<OutboxEvent>(rs.getString("json_data")))
+                }
+            }
+        }
+        return list
+    }
+
+    override fun markOutboxDispatched(eventId: String, dispatchedAtEpochMs: Long) {
+        getConnection().use { conn ->
+            conn.prepareStatement("UPDATE outbox_events SET status = 'DISPATCHED', dispatched_at = ? WHERE event_id = ?").use { stmt ->
+                stmt.setLong(1, dispatchedAtEpochMs)
+                stmt.setString(2, eventId)
+                stmt.executeUpdate()
+            }
+        }
     }
 }
 

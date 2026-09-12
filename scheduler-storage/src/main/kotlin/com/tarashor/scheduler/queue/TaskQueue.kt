@@ -15,7 +15,7 @@ import kotlin.random.Random
 
 interface TaskQueue {
     suspend fun enqueue(task: TaskInstance)
-    suspend fun poll(maxWaitMs: Long = 1000): TaskInstance?
+    suspend fun poll(lookaheadMs: Long = 0L, maxWaitMs: Long = 1000L): TaskInstance?
     suspend fun requeueWithBackoff(task: TaskInstance, reason: String): TaskInstance
     suspend fun sendToDlq(task: TaskInstance, reason: String): DeadLetterEntry
     suspend fun getDlqEntries(): List<DeadLetterEntry>
@@ -24,39 +24,54 @@ interface TaskQueue {
     suspend fun dlqSize(): Int
 }
 
-class InMemoryTaskQueue : TaskQueue {
+class InMemoryTaskQueue(val numShards: Int = 16) : TaskQueue {
     private val logger = LoggerFactory.getLogger(InMemoryTaskQueue::class.java)
 
-    // Priority queue ordered by scheduledAtEpochMs ascending
-    private val readyQueue = PriorityQueue<TaskInstance>(compareBy { it.scheduledAtEpochMs })
-    private val mutex = Mutex()
+    private class Shard {
+        val mutex = Mutex()
+        val readyQueue = PriorityQueue<TaskInstance>(compareBy { it.scheduledAtEpochMs })
+    }
+
+    private val shards = Array(numShards) { Shard() }
+    private val roundRobinIndex = java.util.concurrent.atomic.AtomicInteger(0)
 
     // Dead letter store
     private val dlq = ConcurrentHashMap<String, DeadLetterEntry>()
 
+    private fun getShard(taskInstanceId: String): Shard {
+        val shardId = (taskInstanceId.hashCode() and 0x7FFFFFFF) % numShards
+        return shards[shardId]
+    }
+
     override suspend fun enqueue(task: TaskInstance) {
-        mutex.withLock {
-            val queued = task.copy(status = TaskStatus.QUEUED)
-            readyQueue.add(queued)
-            logger.info("Enqueued task instance '${task.taskInstanceId}' scheduled for ${task.scheduledAtEpochMs} ms")
+        val queued = task.copy(status = TaskStatus.QUEUED)
+        val shard = getShard(queued.taskInstanceId)
+        shard.mutex.withLock {
+            shard.readyQueue.add(queued)
+            logger.info("Enqueued task instance '${task.taskInstanceId}' to shard for ${task.scheduledAtEpochMs} ms")
         }
     }
 
-    override suspend fun poll(maxWaitMs: Long): TaskInstance? {
+    override suspend fun poll(lookaheadMs: Long, maxWaitMs: Long): TaskInstance? {
         val deadline = System.currentTimeMillis() + maxWaitMs
         while (System.currentTimeMillis() <= deadline) {
-            val taskToRun = mutex.withLock {
-                val now = System.currentTimeMillis()
-                val peeked = readyQueue.peek()
-                if (peeked != null && peeked.scheduledAtEpochMs <= now) {
-                    readyQueue.poll()
-                } else {
-                    null
-                }
-            }
+            val now = System.currentTimeMillis()
+            val threshold = now + lookaheadMs
 
-            if (taskToRun != null) {
-                return taskToRun
+            val startIdx = (roundRobinIndex.getAndIncrement() and 0x7FFFFFFF) % numShards
+            for (i in 0 until numShards) {
+                val shard = shards[(startIdx + i) % numShards]
+                val taskToRun = shard.mutex.withLock {
+                    val peeked = shard.readyQueue.peek()
+                    if (peeked != null && peeked.scheduledAtEpochMs <= threshold) {
+                        shard.readyQueue.poll()
+                    } else {
+                        null
+                    }
+                }
+                if (taskToRun != null) {
+                    return taskToRun
+                }
             }
 
             kotlinx.coroutines.delay(min(50L, maxWaitMs))
@@ -124,6 +139,12 @@ class InMemoryTaskQueue : TaskQueue {
         return resetTask
     }
 
-    override suspend fun queueSize(): Int = mutex.withLock { readyQueue.size }
+    override suspend fun queueSize(): Int {
+        var total = 0
+        for (shard in shards) {
+            total += shard.mutex.withLock { shard.readyQueue.size }
+        }
+        return total
+    }
     override suspend fun dlqSize(): Int = dlq.size
 }

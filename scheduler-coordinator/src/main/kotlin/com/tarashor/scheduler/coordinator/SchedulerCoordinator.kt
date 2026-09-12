@@ -56,6 +56,8 @@ class SchedulerCoordinator(
     // Cron tracking: jobId -> nextScheduledRunEpochMs
     private val nextCronRuns = ConcurrentHashMap<String, Long>()
 
+    val outboxDispatcher = com.tarashor.scheduler.outbox.TransactionalOutboxDispatcher(storage, taskQueue)
+
     val leaderElector = LeaderElector(
         nodeId = coordinatorId,
         leaseStore = leaseStore,
@@ -77,6 +79,7 @@ class SchedulerCoordinator(
         if (!isRunning.compareAndSet(false, true)) return
         logger.info("Starting SchedulerCoordinator '$coordinatorId'")
         leaderElector.start()
+        outboxDispatcher.start(pollIntervalMs = 500L)
 
         // 1. Scheduling clock loop (runs only when this node is leader)
         scope.launch {
@@ -171,7 +174,7 @@ class SchedulerCoordinator(
         )
         storage.saveRun(run)
 
-        // Directly enqueue all tasks of the job
+        // Transactional Outbox + Fast Path Enqueue
         for (taskSpec in job.tasks) {
             val instance = TaskInstance(
                 taskInstanceId = "$runId-${taskSpec.taskId}-1",
@@ -185,8 +188,15 @@ class SchedulerCoordinator(
                 scheduledAtEpochMs = now,
                 fencingToken = fencingToken
             )
+            val outboxEvent = OutboxEvent(
+                eventId = UUID.randomUUID().toString(),
+                aggregateId = instance.taskInstanceId,
+                taskInstance = instance
+            )
             storage.saveTaskInstance(instance)
+            storage.saveOutboxEvent(outboxEvent)
             taskQueue.enqueue(instance)
+            storage.markOutboxDispatched(outboxEvent.eventId)
         }
 
         return run
@@ -271,6 +281,7 @@ class SchedulerCoordinator(
         if (isRunning.compareAndSet(true, false)) {
             logger.info("Stopping Coordinator '$coordinatorId'")
             leaderElector.stop()
+            outboxDispatcher.stop()
             scope.cancel()
         }
     }
