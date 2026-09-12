@@ -30,22 +30,27 @@
    - [Дедуплікація завдань (Idempotency Key)](#дедуплікація-завдань-idempotency-key)
    - [Примусовий запуск (Force Run) та скасування](#примусовий-запуск-force-run-та-скасування)
    - [Push HTTP Webhooks з експоненційним Backoff та джитером](#push-http-webhooks-з-експоненційним-backoff-та-джитером)
-4. [Системний дизайн: Шаблон для співбесід](#4-системний-дизайн-шаблон-для-співбесід)
+4. [Моделі даних та сховища (Де що зберігається)](#4-моделі-даних-та-сховища-де-що-зберігається)
+   - [Діаграма сутностей (Entity Relationship Diagram)](#діаграма-сутностей-entity-relationship-diagram)
+   - [Опис доменних моделей коду](#опис-доменних-моделей-коду)
+   - [Матриця фізичного зберігання: Де що зберігається](#матриця-фізичного-зберігання-де-що-зберігається)
+   - [SQL DDL Схеми таблиць у PostgreSQL](#sql-ddl-схеми-таблиць-у-postgresql)
+5. [Системний дизайн: Шаблон для співбесід](#5-системний-дизайн-шаблон-для-співбесід)
    - [Функціональні та нефункціональні вимоги](#функціональні-та-нефункціональні-вимоги)
    - [Оцінка пропускної здатності та масштаб (10k QPS)](#оцінка-пропускної-здатності-та-масштаб-10k-qps)
    - [Захист від Split-Brain через Fencing Tokens](#захист-від-split-brain-через-fencing-tokens)
    - [Worker-Side Hashed Timing Wheel (< 50ms точність)](#worker-side-hashed-timing-wheel--50ms-точність)
-5. [Багатомодульна структура кодової бази](#5-багатомодульна-структура-кодової-бази)
-6. [Запуск мікросервісів](#6-запуск-мікросервісів)
+6. [Багатомодульна структура кодової бази](#6-багатомодульна-структура-кодової-бази)
+7. [Запуск мікросервісів](#7-запуск-мікросервісів)
    - [Варіант A: Docker Compose (Self-Hosted Кластер на PostgreSQL)](#варіант-a-docker-compose-self-hosted-кластер-на-postgresql)
    - [Варіант B: Локальний запуск через Gradle](#варіант-b-локальний-запуск-через-gradle)
    - [Інтерактивна веб-панель керування (Dashboard)](#інтерактивна-веб-панель-керування-dashboard)
-7. [Повний довідник REST API (з прикладами cURL)](#7-повний-довідник-rest-api-з-прикладами-curl)
+8. [Повний довідник REST API (з прикладами cURL)](#8-повний-довідник-rest-api-з-прикладами-curl)
    - [Google Cloud Tasks: Queues API](#google-cloud-tasks-queues-api)
    - [Google Cloud Tasks: Tasks API](#google-cloud-tasks-tasks-api)
    - [Mock Target Webhook для тестування](#mock-target-webhook-для-тестування)
    - [Кластерні ендпоінти та Cron API](#кластерні-ендпоінти-та-cron-api)
-8. [Верифікація тестового набору](#8-верифікація-тестового-набору)
+9. [Верифікація тестового набору](#9-верифікація-тестового-набору)
 
 ---
 
@@ -253,7 +258,192 @@ RETURNING *;
 
 ---
 
-## 4. Системний дизайн: Шаблон для співбесід
+## 4. Моделі даних та сховища (Де що зберігається)
+
+Усі доменні моделі реалізовані мовою Kotlin у модулі [`Models.kt`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt) з підтримкою серіалізації `kotlinx.serialization`.
+
+### Діаграма сутностей (Entity Relationship Diagram)
+
+```mermaid
+erDiagram
+    QueueSpec ||--o{ TaskSpec : "1:N містить завдання"
+    TaskSpec ||--|| TaskTarget : "має ціль (HTTP/Shell)"
+    QueueSpec ||--|| RateLimits : "налаштування лімітів"
+    QueueSpec ||--|| RetryConfig : "політика повторів"
+    
+    JobSpec ||--o{ JobRun : "1:N запуски"
+    JobRun ||--o{ JobExecution : "1:N виконання"
+    JobExecution ||--o| DeadLetterEntry : "помилки > maxRetries"
+    
+    WorkerInfo ||--o{ JobExecution : "виконує прямо зараз"
+    LeaderLease ||--|| Coordinator : "лідерство кластера"
+    OutboxEvent ||--|| JobExecution : "транзакційна доставка"
+```
+
+---
+
+### Опис доменних моделей коду
+
+#### 1. Моделі Google Cloud Tasks
+* **[`QueueSpec`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L302-L308)**: Черга завдань.
+  - `queueId: String` — унікальний ідентифікатор черги (наприклад, `default`, `email-queue`, `billing`).
+  - `state: QueueState` — стан черги: `RUNNING` (активна), `PAUSED` (призупинена), `DISABLED` (вимкнена).
+  - `rateLimits: RateLimits` — налаштування Token Bucket: `maxDispatchesPerSecond` (швидкість), `maxConcurrentDispatches` (паралельність), `maxBurstSize` (ємність бакета).
+  - `retryConfig: RetryConfig` — політика повторів: `maxAttempts` (макс. спроб), `minBackoffMs`, `maxBackoffMs`, `maxDoublings`.
+  - `createdAtEpochMs: Long` — час створення черги.
+
+* **[`TaskSpec`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L359-L399)** (або `CloudTask`): Атомарне завдання.
+  - `taskId: String` — унікальний ідентифікатор завдання або клієнтський Idempotency-Key.
+  - `queueId: String` — черга, якій належить це завдання.
+  - `scheduleTimeEpochMs: Long` — запланований час виконання (якщо $\le now$ — запускається негайно).
+  - `target: TaskTarget` — дія виконання:
+    - `TaskTarget.HttpRequest(url, httpMethod, body, headers)` — Push HTTP-вебхук.
+    - `TaskTarget.Shell(command)` — виконання Shell-команди на хості воркера.
+    - `TaskTarget.Simulate(durationMs, shouldFail, message)` — симуляція для тестів навантаження.
+  - `status: TaskStatus` — статус: `SCHEDULED`, `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`.
+  - `attempt: Int` / `maxAttempts: Int` — поточна спроба та ліміт спроб.
+  - `dispatchedAtEpochMs: Long?` / `completedAtEpochMs: Long?` — часові мітки життєвого циклу.
+  - `responseCode: Int?` / `responseOutput: String?` / `lastError: String?` — результат виконання.
+
+* **[`QueueStats`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L311-L320)**: Агрегована статистика черги для моніторингу та UI.
+  - Кількість завдань за зрізами: `pendingTaskCount`, `runningTaskCount`, `completedTaskCount`, `failedTaskCount`.
+
+#### 2. Моделі черги виконання та історії (Batch/Cron сумісність)
+* **[`JobExecution`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L100-L158)** (або `TaskInstance`): Екземпляр завдання в активній черзі виконання.
+  - `executionId: String`, `jobId: String`, `runId: String`, `status: JobStatus`.
+  - `assignedWorkerId: String?` — ID воркера, який прямо зараз виконує це завдання.
+  - `fencingToken: Long` — монотонний токен лідера, який створив або диспетчеризував запуск.
+  - `lastHeartbeatEpochMs: Long?` — час останнього підтвердження виконання від воркера.
+
+* **[`JobSpec`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L23-L33)**: Визначення періодичного або разового завдання (Cron/Batch).
+  - `schedule: ScheduleSpec` — розклад: `Immediate`, `Cron(expression)`, `OneOff(epochMs)`.
+  - `action: JobAction` — дія (`Http`, `Shell`, `Simulate`).
+
+* **[`JobRun`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L87-L97)**: Журнал конкретного запуску завдання (`runId`, `jobId`, `status`, `triggeredAtEpochMs`, `triggerSource`).
+
+#### 3. Моделі кластерної координації та надійності
+* **[`WorkerInfo`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L172-L184)**: Телеметрія воркера.
+  - `workerId: String`, `capacity: Int`, `currentLoad: Int`.
+  - `status: WorkerStatus` — `HEALTHY`, `SUSPECT`, `DEAD`, `DRAINING`.
+  - `activeTaskIds: Set<String>` — множина ідентифікаторів завдань, що виконуються воркером у цей момент.
+  - `lastHeartbeatEpochMs: Long` — таймстемп останнього пульсу (оновлюється кожні 2 сек).
+
+* **[`LeaderLease`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L187-L192)**: Контракт активного лідера кластера координаторів.
+  - `leaderId: String` — ID координатора, що володіє лізом.
+  - `fencingToken: Long` — монотонно зростаючий лічильник епохи лідерства ($E_{k+1} = E_k + 1$).
+  - `expiresAtEpochMs: Long` — час закінчення дії лізу.
+
+* **[`OutboxEvent`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L241-L272)**: Транзакційна подія Outbox для гарантії доставки без втрат (Zero-Loss).
+  - `eventId: String`, `aggregateType: String`, `aggregateId: String`, `status: OutboxStatus (PENDING, DISPATCHED, FAILED)`.
+
+* **[`DeadLetterEntry`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/core/model/Models.kt#L195-L202)**: Запис у черзі помилок DLQ після вичерпання `maxRetries`.
+
+---
+
+### Матриця фізичного зберігання: Де що зберігається
+
+У системі реалізовано патерн **Segregated Storage Adapters** (порти та адаптери). Залежно від обраного рушія ([`StorageFactory.kt`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/storage/StorageFactory.kt)) дані зберігаються у відповідних фізичних структурах:
+
+| Доменна модель | Основне сховище: PostgreSQL 16 ([`PostgresStores.kt`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/storage/PostgresStores.kt)) | Fallback сховище: Redis 7 ([`RedisStorage.kt`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/storage/RedisStorage.kt)) | Dev сховище: SQLite ([`SqliteStores.kt`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/storage/SqliteStores.kt)) | Тестове: In-Memory ([`InMemoryStores.kt`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/storage/InMemoryStores.kt)) | Патерн доступу та індекси |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`QueueSpec`** | Таблиця **`queues`** | — | Таблиця **`queues`** | `ConcurrentHashMap<String, QueueSpec>` | Точковий CRUD за `queue_id` (PK). |
+| **`TaskSpec`** | Таблиця **`cloud_tasks`** | — | Таблиця **`cloud_tasks`** | `ConcurrentHashMap<String, TaskSpec>` | Індекс за `(queue_id, status, schedule_time)`. |
+| **`TaskInstance` (Черга завдань)** | Таблиця **`task_instances`** | **16 шардованих ZSET** (`scheduler:queue:ready:{0..15}`) | Таблиця **`task_instances`** | **`InMemoryTaskQueue`** (16 шардів із `PriorityQueue`) | `SELECT ... FOR UPDATE SKIP LOCKED` за `scheduled_at`. |
+| **`WorkerInfo`** | Таблиця **`workers`** | Hash **`scheduler:workers`** | Таблиця **`workers`** | `ConcurrentHashMap<String, WorkerInfo>` | Upsert кожні 2 секунди за `worker_id` (PK). |
+| **`LeaderLease`** | Таблиця **`cluster_leases`** | Ключ **`scheduler:lease:leader`** (`SET NX PX`) | Таблиця **`cluster_leases`** | `AtomicReference<LeaderLease?>` | Conditional Update за `expires_at` з `fencing_token`. |
+| **`JobSpec`** | Таблиця **`jobs`** | Hash **`scheduler:jobs`** | Таблиця **`jobs`** | `ConcurrentHashMap<String, JobSpec>` | Читання за `job_id` (PK). |
+| **`JobRun`** | Таблиця **`job_runs`** | Hash **`scheduler:runs`** | Таблиця **`job_runs`** | `ConcurrentHashMap<String, JobRun>` | Append-only історія запусків, індекс за `triggered_at DESC`. |
+| **`OutboxEvent`** | Таблиця **`outbox_events`** | Hash **`scheduler:outbox`** | Таблиця **`outbox_events`** | `ConcurrentHashMap<String, OutboxEvent>` | Polling `WHERE status = 'PENDING'` з переведенням у `DISPATCHED`. |
+| **`DeadLetterEntry`** | Таблиця **`dlq_entries`** | ZSET / List **`scheduler:queue:dlq`** | Таблиця **`dlq_entries`** | `ConcurrentHashMap<String, DeadLetterEntry>` | Читання та повторний запуск через `retryDlqEntry`. |
+
+---
+
+### SQL DDL Схеми таблиць у PostgreSQL
+
+При старті сервісу [`PostgresStores.kt`](file:///Users/tarasgoriachko/projects/private/job-scheduler/scheduler-common/src/main/kotlin/com/tarashor/scheduler/storage/PostgresStores.kt) автоматично ініціалізує такі оптимізовані таблиці:
+
+```sql
+-- 1. Черги Google Cloud Tasks (Налаштування, рейт-ліміти, стан)
+CREATE TABLE IF NOT EXISTS queues (
+    queue_id VARCHAR(255) PRIMARY KEY,
+    state VARCHAR(50) NOT NULL,
+    json_data TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+
+-- 2. Завдання Google Cloud Tasks (Індексована черга)
+CREATE TABLE IF NOT EXISTS cloud_tasks (
+    task_id VARCHAR(255) PRIMARY KEY,
+    queue_id VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    schedule_time BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    json_data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_tasks_schedule ON cloud_tasks(queue_id, status, schedule_time);
+CREATE INDEX IF NOT EXISTS idx_cloud_tasks_created ON cloud_tasks(created_at DESC);
+
+-- 3. Активна черга екземплярів виконання (Для SELECT ... FOR UPDATE SKIP LOCKED)
+CREATE TABLE IF NOT EXISTS task_instances (
+    instance_id VARCHAR(255) PRIMARY KEY,
+    run_id VARCHAR(255) NOT NULL,
+    job_id VARCHAR(255) NOT NULL,
+    task_id VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    scheduled_at BIGINT NOT NULL,
+    json_data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_instances_poll ON task_instances(status, scheduled_at);
+
+-- 4. Розподілений лізинг лідера координаторів із Fencing Tokens
+CREATE TABLE IF NOT EXISTS cluster_leases (
+    lease_key VARCHAR(255) PRIMARY KEY,
+    leader_id VARCHAR(255) NOT NULL,
+    fencing_token BIGINT NOT NULL,
+    acquired_at BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL
+);
+
+-- 5. Реєстр воркерів та Heartbeats
+CREATE TABLE IF NOT EXISTS workers (
+    worker_id VARCHAR(255) PRIMARY KEY,
+    status VARCHAR(50) NOT NULL,
+    last_heartbeat BIGINT NOT NULL,
+    json_data TEXT NOT NULL
+);
+
+-- 6. Транзакційний Outbox
+CREATE TABLE IF NOT EXISTS outbox_events (
+    event_id VARCHAR(255) PRIMARY KEY,
+    aggregate_type VARCHAR(255) NOT NULL,
+    aggregate_id VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    created_at BIGINT NOT NULL,
+    dispatched_at BIGINT,
+    json_data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_events_status ON outbox_events(status, created_at ASC);
+
+-- 7. Специфікації завдань (JobSpec) та історія запусків (JobRun)
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id VARCHAR(255) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    json_data TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS job_runs (
+    run_id VARCHAR(255) PRIMARY KEY,
+    job_id VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    triggered_at BIGINT NOT NULL,
+    json_data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_runs_triggered ON job_runs(triggered_at DESC);
+```
+
+---
+
+## 5. Системний дизайн: Шаблон для співбесід
 
 ### Функціональні та нефункціональні вимоги
 
@@ -288,7 +478,7 @@ $$E_{k+1} = E_k + 1$$
 
 ---
 
-## 5. Багатомодульна структура кодової бази
+## 6. Багатомодульна структура кодової бази
 
 ```
 job-scheduler/
@@ -321,7 +511,7 @@ job-scheduler/
 
 ---
 
-## 6. Запуск мікросервісів
+## 7. Запуск мікросервісів
 
 ### Варіант A: Docker Compose (Self-Hosted Кластер на PostgreSQL)
 
@@ -379,7 +569,7 @@ WORKER_ID=worker-alpha ./gradlew :scheduler-worker:bootRun
 
 ---
 
-## 7. Повний довідник REST API (з прикладами cURL)
+## 8. Повний довідник REST API (з прикладами cURL)
 
 ### Google Cloud Tasks: Queues API
 
@@ -534,7 +724,7 @@ curl -X POST http://localhost:8080/api/mock/target \
 
 ---
 
-## 8. Верифікація тестового набору
+## 9. Верифікація тестового набору
 
 Усі компоненти покриті модульними та інтеграційними тестами:
 ```bash
