@@ -1,31 +1,32 @@
 # Multi-stage build for distributed microservices
-FROM eclipse-temurin:25-jdk-alpine AS builder
+FROM eclipse-temurin:21-jdk-alpine AS builder
 WORKDIR /app
 COPY . .
-RUN ./gradlew installDist --no-daemon
+RUN ./gradlew bootJar --no-daemon
 
 # -----------------------------------------------
 # Target: API Gateway Microservice
 # -----------------------------------------------
-FROM eclipse-temurin:25-jre-alpine AS api
+FROM eclipse-temurin:21-jre-alpine AS api
 WORKDIR /app
-COPY --from=builder /app/scheduler-api/build/install/scheduler-api /app
+COPY --from=builder /app/scheduler-api/build/libs/scheduler-api-1.0-SNAPSHOT.jar /app/app.jar
 ENV PORT=8080
 EXPOSE 8080
-ENTRYPOINT ["/app/bin/scheduler-api"]
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
 
 # -----------------------------------------------
 # Target: Master Coordinator Microservice
 # -----------------------------------------------
-FROM eclipse-temurin:25-jre-alpine AS coordinator
+FROM eclipse-temurin:21-jre-alpine AS coordinator
 WORKDIR /app
-COPY --from=builder /app/scheduler-coordinator/build/install/scheduler-coordinator /app
-ENTRYPOINT ["/app/bin/scheduler-coordinator"]
+COPY --from=builder /app/scheduler-coordinator/build/libs/scheduler-coordinator-1.0-SNAPSHOT.jar /app/app.jar
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
 
 # -----------------------------------------------
 # Target: Worker Daemon Microservice
 # -----------------------------------------------
-FROM eclipse-temurin:25-jre-alpine AS worker
+FROM eclipse-temurin:21-jre-alpine AS worker
 WORKDIR /app
-COPY --from=builder /app/scheduler-worker/build/install/scheduler-worker /app
-ENTRYPOINT ["/app/bin/scheduler-worker"]
+COPY --from=builder /app/scheduler-worker/build/libs/scheduler-worker-1.0-SNAPSHOT.jar /app/app.jar
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+

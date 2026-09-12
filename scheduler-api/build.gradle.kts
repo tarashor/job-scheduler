@@ -1,18 +1,16 @@
 plugins {
-    application
-}
-
-application {
-    mainClass.set("com.tarashor.scheduler.api.ApiAppKt")
+    id("org.springframework.boot")
+    id("io.spring.dependency-management")
+    kotlin("plugin.spring")
 }
 
 dependencies {
     implementation(project(":scheduler-common"))
     implementation(project(":scheduler-storage"))
-    val ktorVersion = "3.1.1"
-    implementation("io.ktor:ktor-server-core:$ktorVersion")
-    implementation("io.ktor:ktor-server-cio:$ktorVersion")
-    implementation("io.ktor:ktor-server-content-negotiation:$ktorVersion")
-    implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
-    implementation("io.ktor:ktor-server-cors:$ktorVersion")
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-reactor")
+    implementation(enforcedPlatform("org.jetbrains.kotlinx:kotlinx-serialization-bom:1.8.0"))
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
 }
+

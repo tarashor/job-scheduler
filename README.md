@@ -1,8 +1,8 @@
 # Розподілений планувальник завдань (Мікросервісна архітектура)
 
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.4.0-blue.svg)](https://kotlinlang.org)
-[![JDK](https://img.shields.io/badge/JDK-25%2B-orange.svg)](https://openjdk.org)
-[![Ktor](https://img.shields.io/badge/Ktor-3.1.1-purple.svg)](https://ktor.io)
+[![JDK](https://img.shields.io/badge/JDK-21%2B-orange.svg)](https://openjdk.org)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.4.3-brightgreen.svg)](https://spring.io/projects/spring-boot)
 [![Docker Compose](https://img.shields.io/badge/Docker%20Compose-Ready-blue.svg)]()
 [![Tests](https://img.shields.io/badge/Tests-Passing-brightgreen.svg)]()
 
@@ -395,22 +395,28 @@ job-scheduler/
 │       ├── DatabasePerMicroserviceTest.kt # Тести суворої ізоляції баз даних для кожного сервісу
 │       ├── LeaderElectionTest.kt         # Тести лізингу та Fencing Tokens
 │       └── TaskQueueAndDLQTest.kt        # Тести черги затримок та Dead Letter Queue
-├── scheduler-api/                        # [Мікросервіс 1: API Gateway & Dashboard]
+├── scheduler-api/                        # [Мікросервіс 1: Spring Boot REST API & Dashboard]
 │   └── src/main/kotlin/com/tarashor/scheduler/
-│       ├── api/ApiApp.kt                 # Головна точка входу API з власним JobMetadataStore
-│       ├── api/SchedulerApiServer.kt     # Маршрути Ktor REST API та налаштування CORS
+│       ├── api/ApiApplication.kt         # Головна точка входу Spring Boot (@SpringBootApplication)
+│       ├── api/ApiController.kt          # Spring REST Controller (@RestController)
+│       ├── api/ApiConfig.kt              # Налаштування Spring Web MVC, CORS та біни сховищ
+│       ├── api/DashboardController.kt    # Spring Controller для UI панелі
 │       └── ui/DashboardHtml.kt           # Вбудована односторінкова веб-панель
 ├── scheduler-coordinator/                # [Мікросервіс 2: Distributed Coordinator]
 │   ├── src/main/kotlin/com/tarashor/scheduler/coordinator/
-│   │   ├── CoordinatorApp.kt             # Головна точка входу координатора
+│   │   ├── CoordinatorApplication.kt     # Головна точка входу Spring Boot (@SpringBootApplication)
+│   │   ├── CoordinatorConfig.kt          # Налаштування бінів лідерства та сховищ
+│   │   ├── CoordinatorService.kt         # Життєвий цикл сервісу (@EventListener ApplicationReadyEvent)
 │   │   └── SchedulerCoordinator.kt       # Вибори лідера, годинник розкладу та життєвий цикл запусків
 │   └── src/test/kotlin/com/tarashor/scheduler/
 │       └── EndToEndSchedulerTest.kt      # Наскрізні тести паралельного виконання та decoupled Database-per-Microservice
 └── scheduler-worker/                     # [Мікросервіс 3: Stateless Worker Daemon]
     └── src/main/kotlin/com/tarashor/scheduler/worker/
-        ├── WorkerApp.kt                  # Головна точка входу воркера (БЕЗ доступу до метаданих БД)
+        ├── WorkerApplication.kt          # Головна точка входу Spring Boot (@SpringBootApplication)
+        ├── WorkerConfig.kt               # Налаштування бінів та параметрів пулу завдань
+        ├── WorkerService.kt              # Життєвий цикл воркера (Heartbeats, polling)
         ├── WorkerNode.kt                 # Цикл опитування черги, керування місткістю та heartbeats
-        └── TaskRunner.kt                 # Середовище виконання: HTTP-вебхуки, Shell-скрипти
+        └── TaskRunner.kt                 # Середовище виконання: HTTP-вебхуки (Java HttpClient), Shell-скрипти
 ```
 
 ---
@@ -426,9 +432,9 @@ docker-compose up --build
 
 Ця команда розгортає:
 - **`scheduler-redis`**: Розподілений шар черги затримок (`ZSET`), лідерських блокувань (`SET NX PX`) та реєстру воркерів на порті `6379`.
-- **`scheduler-api-service`**: API-шлюз та Web UI на адресі `http://localhost:8080`, підключений до власної персистентної бази метаданих через том `metadata-storage` (`/app/data/api_metadata.db`).
-- **`scheduler-coordinator-primary`**: Основний активний координатор (лідер).
-- **`scheduler-coordinator-standby`**: Резервний координатор для автоматичного перехоплення лідерства (Failover).
+- **`scheduler-api-service`**: Spring Boot API-шлюз та Web UI на адресі `http://localhost:8080`, підключений до власної персистентної бази метаданих через том `metadata-storage` (`/app/data/api_metadata.db`).
+- **`scheduler-coordinator-primary`**: Основний активний координатор (Spring Boot лідер).
+- **`scheduler-coordinator-standby`**: Резервний координатор для автоматичного перехоплення лідерства (Spring Boot Failover).
 - **`scheduler-worker-alpha`**: Перший воркер-под (місткість: 4 завдання). **Повністю Stateless** (БЕЗ томів БД).
 - **`scheduler-worker-beta`**: Другий воркер-под (місткість: 4 завдання). **Повністю Stateless** (БЕЗ томів БД).
 
@@ -438,20 +444,20 @@ docker-compose up --build
 
 ### Варіант B: Локальні Gradle-сервіси (Режим розробки)
 
-Кожен мікросервіс можна запустити окремо у власному терміналі:
+Кожен Spring Boot мікросервіс можна запустити окремо у власному терміналі за допомогою `bootRun`:
 
 ```bash
 # Термінал 1: Запуск API-мікросервісу
-./gradlew :scheduler-api:run
+./gradlew :scheduler-api:bootRun
 
 # Термінал 2: Запуск майстер-координатора
-./gradlew :scheduler-coordinator:run
+./gradlew :scheduler-coordinator:bootRun
 
 # Термінал 3: Запуск воркер-пода Alpha
-WORKER_ID=worker-alpha ./gradlew :scheduler-worker:run
+WORKER_ID=worker-alpha ./gradlew :scheduler-worker:bootRun
 
 # Термінал 4: Запуск воркер-пода Beta
-WORKER_ID=worker-beta ./gradlew :scheduler-worker:run
+WORKER_ID=worker-beta ./gradlew :scheduler-worker:bootRun
 ```
 
 ---

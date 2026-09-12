@@ -3,14 +3,13 @@ package com.tarashor.scheduler.worker
 import com.tarashor.scheduler.core.model.TaskAction
 import com.tarashor.scheduler.core.model.TaskExecutionResult
 import com.tarashor.scheduler.core.model.TaskInstance
-import io.ktor.client.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.request.*
-import io.ktor.client.statement.*
-import io.ktor.http.*
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
-import java.io.File
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
 import java.util.concurrent.TimeUnit
 
 interface TaskRunner {
@@ -19,14 +18,16 @@ interface TaskRunner {
 
 class DefaultTaskRunner : TaskRunner {
     private val logger = LoggerFactory.getLogger(DefaultTaskRunner::class.java)
-    private val httpClient = HttpClient(CIO)
+    private val httpClient: HttpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(10))
+        .build()
 
     override suspend fun execute(instance: TaskInstance, timeoutMs: Long): TaskExecutionResult {
         return try {
             withTimeout(timeoutMs) {
                 when (val action = instance.action) {
                     is TaskAction.Shell -> executeShell(instance, action)
-                    is TaskAction.Http -> executeHttp(instance, action)
+                    is TaskAction.Http -> executeHttp(instance, action, timeoutMs)
                     is TaskAction.Simulate -> executeSimulate(instance, action)
                 }
             }
@@ -74,24 +75,41 @@ class DefaultTaskRunner : TaskRunner {
             )
         }
 
-    private suspend fun executeHttp(instance: TaskInstance, action: TaskAction.Http): TaskExecutionResult {
-        logger.info("Executing HTTP ${action.method} request for '${instance.taskInstanceId}' to ${action.url}")
-        val response = httpClient.request(action.url) {
-            method = HttpMethod.parse(action.method)
-            action.headers.forEach { (k, v) -> header(k, v) }
-            if (action.body != null) {
-                setBody(action.body)
+    private suspend fun executeHttp(instance: TaskInstance, action: TaskAction.Http, timeoutMs: Long): TaskExecutionResult =
+        withContext(Dispatchers.IO) {
+            logger.info("Executing HTTP ${action.method} request for '${instance.taskInstanceId}' to ${action.url}")
+            try {
+                val requestBuilder = HttpRequest.newBuilder()
+                    .uri(URI.create(action.url))
+                    .timeout(Duration.ofMillis(timeoutMs))
+
+                action.headers.forEach { (k, v) -> requestBuilder.header(k, v) }
+
+                val bodyPublisher = if (action.body != null) {
+                    HttpRequest.BodyPublishers.ofString(action.body)
+                } else {
+                    HttpRequest.BodyPublishers.noBody()
+                }
+
+                requestBuilder.method(action.method, bodyPublisher)
+
+                val response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+                val isSuccess = response.statusCode() in 200..299
+                val body = response.body() ?: ""
+                TaskExecutionResult(
+                    taskInstanceId = instance.taskInstanceId,
+                    success = isSuccess,
+                    output = "HTTP ${response.statusCode()}: $body",
+                    error = if (!isSuccess) "HTTP status ${response.statusCode()}" else null
+                )
+            } catch (e: Exception) {
+                TaskExecutionResult(
+                    taskInstanceId = instance.taskInstanceId,
+                    success = false,
+                    error = e.message ?: e.javaClass.simpleName
+                )
             }
         }
-        val isSuccess = response.status.value in 200..299
-        val body = response.bodyAsText()
-        return TaskExecutionResult(
-            taskInstanceId = instance.taskInstanceId,
-            success = isSuccess,
-            output = "HTTP ${response.status}: $body",
-            error = if (!isSuccess) "HTTP status ${response.status}" else null
-        )
-    }
 
     private suspend fun executeSimulate(instance: TaskInstance, action: TaskAction.Simulate): TaskExecutionResult {
         logger.info("Simulating task '${instance.taskInstanceId}' for ${action.durationMs}ms")
