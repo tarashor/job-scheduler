@@ -182,84 +182,76 @@ class SchedulerCoordinator(
         )
         storage.saveRun(run)
 
-        // Transactional Outbox + Fast Path Enqueue
-        for (taskSpec in job.tasks) {
-            val instance = TaskInstance(
-                taskInstanceId = "$runId-${taskSpec.taskId}-1",
-                runId = runId,
-                jobId = jobId,
-                taskId = taskSpec.taskId,
-                status = TaskStatus.QUEUED,
-                attempt = 1,
-                maxRetries = taskSpec.maxRetries,
-                action = taskSpec.action,
-                scheduledAtEpochMs = scheduledAt,
-                fencingToken = fencingToken
-            )
-            val outboxEvent = OutboxEvent(
-                eventId = UUID.randomUUID().toString(),
-                aggregateId = instance.taskInstanceId,
-                taskInstance = instance
-            )
-            storage.saveTaskInstance(instance)
-            storage.saveOutboxEvent(outboxEvent)
-            taskQueue.enqueue(instance)
-            storage.markOutboxDispatched(outboxEvent.eventId)
-        }
+        // Transactional Outbox + Fast Path Enqueue for Atomic Job
+        val execution = JobExecution(
+            executionId = runId,
+            jobId = jobId,
+            runId = runId,
+            status = JobStatus.QUEUED,
+            attempt = 1,
+            maxRetries = job.maxRetries,
+            action = job.action,
+            scheduledAtEpochMs = scheduledAt,
+            fencingToken = fencingToken,
+            triggerSource = triggerSource
+        )
+        val outboxEvent = OutboxEvent(
+            eventId = UUID.randomUUID().toString(),
+            aggregateId = execution.executionId,
+            jobExecution = execution
+        )
+        storage.saveTaskInstance(execution)
+        storage.saveOutboxEvent(outboxEvent)
+        taskQueue.enqueue(execution)
+        storage.markOutboxDispatched(outboxEvent.eventId)
 
         return run
     }
 
     suspend fun handleTaskCompletion(taskInstance: TaskInstance, result: TaskExecutionResult) {
         val job = storage.getJob(taskInstance.jobId) ?: return
-        val run = storage.getRun(taskInstance.runId) ?: return
-        if (run.status != JobStatus.RUNNING) return
+        val run = storage.getRun(taskInstance.runId)
 
         if (result.success) {
             val completedInst = taskInstance.copy(
-                status = TaskStatus.COMPLETED,
+                status = JobStatus.COMPLETED,
                 completedAtEpochMs = System.currentTimeMillis(),
                 output = result.output
             )
             storage.saveTaskInstance(completedInst)
-            logger.info("Task '${taskInstance.taskId}' in run '${run.runId}' COMPLETED successfully")
-
-            // Check if all tasks in this run are completed
-            val allInstances = storage.getTaskInstancesForRun(taskInstance.runId)
-            if (allInstances.all { it.status == TaskStatus.COMPLETED }) {
+            if (run != null) {
                 storage.saveRun(
                     run.copy(
                         status = JobStatus.COMPLETED,
                         completedAtEpochMs = System.currentTimeMillis()
                     )
                 )
-                logger.info("JobRun '${run.runId}' finished with status: COMPLETED")
             }
+            logger.info("Job '${taskInstance.jobId}' (Execution: '${taskInstance.executionId}') COMPLETED successfully")
         } else {
-            // Task failed
-            logger.warn("Task '${taskInstance.taskId}' failed: ${result.error}")
+            // Execution failed
+            logger.warn("Job '${taskInstance.jobId}' (Execution: '${taskInstance.executionId}') failed: ${result.error}")
             val nextAttempt = taskInstance.attempt + 1
             if (nextAttempt <= taskInstance.maxRetries) {
                 // Retry with backoff
-                val retried = taskQueue.requeueWithBackoff(taskInstance, result.error ?: "Task execution failed")
+                val retried = taskQueue.requeueWithBackoff(taskInstance, result.error ?: "Execution failed")
                 storage.saveTaskInstance(retried)
             } else {
-                // Max retries exhausted -> Move to DLQ & Fail JobRun
-                val dlqEntry = taskQueue.sendToDlq(taskInstance, "Exhausted ${taskInstance.maxRetries} retries: ${result.error}")
-                val dlqInst = taskInstance.copy(
-                    status = TaskStatus.DEAD_LETTER,
+                val failedInst = taskInstance.copy(
+                    status = JobStatus.DEAD_LETTER,
                     completedAtEpochMs = System.currentTimeMillis(),
-                    error = dlqEntry.reason
+                    error = result.error
                 )
-                storage.saveTaskInstance(dlqInst)
-                storage.saveRun(
-                    run.copy(
-                        status = JobStatus.FAILED,
-                        completedAtEpochMs = System.currentTimeMillis(),
-                        error = "Task '${taskInstance.taskId}' permanently failed: ${result.error}"
+                storage.saveTaskInstance(failedInst)
+                if (run != null) {
+                    storage.saveRun(
+                        run.copy(
+                            status = JobStatus.FAILED,
+                            completedAtEpochMs = System.currentTimeMillis(),
+                            error = result.error
+                        )
                     )
-                )
-                logger.error("JobRun '${run.runId}' marked as FAILED due to task '${taskInstance.taskId}'")
+                }
             }
         }
     }

@@ -19,9 +19,7 @@ class DatabasePerMicroserviceTest {
             jobId = "job-invoice-generation",
             name = "Invoice Generation Job",
             schedule = ScheduleSpec.Cron("0 0 * * *"),
-            tasks = listOf(
-                TaskSpec("t1", "Fetch Orders", action = TaskAction.Shell("echo fetch"))
-            )
+            action = JobAction.Shell("echo fetch")
         )
 
         // 1. Save and retrieve
@@ -135,17 +133,17 @@ class DatabasePerMicroserviceTest {
             jobId = "composite-job",
             name = "Composite Test",
             schedule = ScheduleSpec.Immediate,
-            tasks = listOf(TaskSpec("t1", "Step 1", action = TaskAction.Shell("echo 1")))
+            action = JobAction.Shell("echo 1")
         )
         composite.saveJob(job)
         assertNotNull(jobStore.getJob("composite-job"))
         assertEquals("Composite Test", composite.getJob("composite-job")?.name)
 
         // 2. Save run through composite -> saved in historyDb
-        val run = JobRun("comp-run-1", "composite-job", JobStatus.PENDING, 123456L)
+        val run = JobRun("comp-run-1", "composite-job", JobStatus.QUEUED, 123456L)
         composite.saveRun(run)
         assertNotNull(historyStore.getRun("comp-run-1"))
-        assertEquals(JobStatus.PENDING, composite.getRun("comp-run-1")?.status)
+        assertEquals(JobStatus.QUEUED, composite.getRun("comp-run-1")?.status)
 
         // 3. Save worker through composite -> saved in workerDb
         val worker = WorkerInfo(

@@ -1,6 +1,6 @@
 package com.tarashor.scheduler.worker
 
-import com.tarashor.scheduler.core.model.TaskAction
+import com.tarashor.scheduler.core.model.JobAction
 import com.tarashor.scheduler.core.model.TaskExecutionResult
 import com.tarashor.scheduler.core.model.TaskInstance
 import kotlinx.coroutines.*
@@ -16,6 +16,8 @@ interface TaskRunner {
     suspend fun execute(instance: TaskInstance, timeoutMs: Long): TaskExecutionResult
 }
 
+typealias JobRunner = TaskRunner
+
 class DefaultTaskRunner : TaskRunner {
     private val logger = LoggerFactory.getLogger(DefaultTaskRunner::class.java)
     private val httpClient: HttpClient = HttpClient.newBuilder()
@@ -26,9 +28,9 @@ class DefaultTaskRunner : TaskRunner {
         return try {
             withTimeout(timeoutMs) {
                 when (val action = instance.action) {
-                    is TaskAction.Shell -> executeShell(instance, action)
-                    is TaskAction.Http -> executeHttp(instance, action, timeoutMs)
-                    is TaskAction.Simulate -> executeSimulate(instance, action)
+                    is JobAction.Shell -> executeShell(instance, action)
+                    is JobAction.Http -> executeHttp(instance, action, timeoutMs)
+                    is JobAction.Simulate -> executeSimulate(instance, action)
                 }
             }
         } catch (e: TimeoutCancellationException) {
@@ -48,7 +50,7 @@ class DefaultTaskRunner : TaskRunner {
         }
     }
 
-    private suspend fun executeShell(instance: TaskInstance, action: TaskAction.Shell): TaskExecutionResult =
+    private suspend fun executeShell(instance: TaskInstance, action: JobAction.Shell): TaskExecutionResult =
         withContext(Dispatchers.IO) {
             logger.info("Executing shell command for '${instance.taskInstanceId}': ${action.command}")
             val process = ProcessBuilder("/bin/sh", "-c", action.command)
@@ -75,7 +77,7 @@ class DefaultTaskRunner : TaskRunner {
             )
         }
 
-    private suspend fun executeHttp(instance: TaskInstance, action: TaskAction.Http, timeoutMs: Long): TaskExecutionResult =
+    private suspend fun executeHttp(instance: TaskInstance, action: JobAction.Http, timeoutMs: Long): TaskExecutionResult =
         withContext(Dispatchers.IO) {
             logger.info("Executing HTTP ${action.method} request for '${instance.taskInstanceId}' to ${action.url}")
             try {
@@ -111,7 +113,7 @@ class DefaultTaskRunner : TaskRunner {
             }
         }
 
-    private suspend fun executeSimulate(instance: TaskInstance, action: TaskAction.Simulate): TaskExecutionResult {
+    private suspend fun executeSimulate(instance: TaskInstance, action: JobAction.Simulate): TaskExecutionResult {
         logger.info("Simulating task '${instance.taskInstanceId}' for ${action.durationMs}ms")
         delay(action.durationMs)
         return if (action.shouldFail) {

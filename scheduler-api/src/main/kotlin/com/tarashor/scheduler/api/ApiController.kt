@@ -150,37 +150,13 @@ class ApiController(
 
     @PostMapping("/samples/job", "/samples/dag")
     fun triggerSampleJob(): ResponseEntity<JobRun> = runBlocking {
-        val jobId = "sample-parallel-job"
+        val jobId = "sample-batch-job"
         val sampleJob = JobSpec(
             jobId = jobId,
             name = "E-Commerce Batch Processing Job",
             schedule = ScheduleSpec.Immediate,
-            tasks = listOf(
-                TaskSpec(
-                    taskId = "extract-sales",
-                    name = "Extract Sales Data",
-                    action = TaskAction.Shell("echo 'Extracted 1500 sales records'"),
-                    timeoutMs = 10_000
-                ),
-                TaskSpec(
-                    taskId = "extract-inventory",
-                    name = "Extract Inventory Data",
-                    action = TaskAction.Shell("echo 'Extracted 320 inventory items'"),
-                    timeoutMs = 10_000
-                ),
-                TaskSpec(
-                    taskId = "transform-metrics",
-                    name = "Transform & Aggregate",
-                    action = TaskAction.Simulate(durationMs = 800, shouldFail = false, message = "Aggregated daily revenue and inventory turnover"),
-                    timeoutMs = 10_000
-                ),
-                TaskSpec(
-                    taskId = "load-warehouse",
-                    name = "Load into Data Warehouse",
-                    action = TaskAction.Shell("echo 'Successfully loaded 1820 rows into Data Warehouse'"),
-                    timeoutMs = 10_000
-                )
-            )
+            action = JobAction.Shell("echo 'Successfully processed daily e-commerce batch'"),
+            timeoutMs = 10_000
         )
         storage.saveJob(sampleJob)
         val run = triggerJob(jobId, triggerSource = "SAMPLE_JOB_TRIGGER")
@@ -214,29 +190,27 @@ class ApiController(
         )
         storage.saveRun(run)
 
-        for (taskSpec in job.tasks) {
-            val instance = TaskInstance(
-                taskInstanceId = "$runId-${taskSpec.taskId}-1",
-                runId = runId,
-                jobId = jobId,
-                taskId = taskSpec.taskId,
-                status = TaskStatus.QUEUED,
-                attempt = 1,
-                maxRetries = taskSpec.maxRetries,
-                action = taskSpec.action,
-                scheduledAtEpochMs = scheduledAt,
-                fencingToken = fencingToken
-            )
-            val outboxEvent = OutboxEvent(
-                eventId = UUID.randomUUID().toString(),
-                aggregateId = instance.taskInstanceId,
-                taskInstance = instance
-            )
-            storage.saveTaskInstance(instance)
-            storage.saveOutboxEvent(outboxEvent)
-            taskQueue.enqueue(instance)
-            storage.markOutboxDispatched(outboxEvent.eventId)
-        }
+        val execution = JobExecution(
+            executionId = runId,
+            jobId = jobId,
+            runId = runId,
+            status = JobStatus.QUEUED,
+            attempt = 1,
+            maxRetries = job.maxRetries,
+            action = job.action,
+            scheduledAtEpochMs = scheduledAt,
+            fencingToken = fencingToken,
+            triggerSource = triggerSource
+        )
+        val outboxEvent = OutboxEvent(
+            eventId = UUID.randomUUID().toString(),
+            aggregateId = execution.executionId,
+            jobExecution = execution
+        )
+        storage.saveTaskInstance(execution)
+        storage.saveOutboxEvent(outboxEvent)
+        taskQueue.enqueue(execution)
+        storage.markOutboxDispatched(outboxEvent.eventId)
 
         return run
     }

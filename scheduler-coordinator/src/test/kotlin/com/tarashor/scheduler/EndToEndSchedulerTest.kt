@@ -46,20 +46,16 @@ class EndToEndSchedulerTest {
         delay(1000)
         assertTrue(coordinator.isLeader())
 
-        // Create multi-task job: A, B, C executed in parallel
+        // Create atomic script job
         val job = JobSpec(
-            jobId = "test-parallel-job",
-            name = "Test Parallel Multi-Task Job",
+            jobId = "test-atomic-job",
+            name = "Test Atomic Script Job",
             schedule = ScheduleSpec.Immediate,
-            tasks = listOf(
-                TaskSpec("task-A", "Step A", action = TaskAction.Shell("echo A")),
-                TaskSpec("task-B", "Step B", action = TaskAction.Shell("echo B")),
-                TaskSpec("task-C", "Step C", action = TaskAction.Shell("echo C"))
-            )
+            action = JobAction.Shell("echo 'Hello Atomic Job'")
         )
         storage.saveJob(job)
 
-        val run = coordinator.triggerJob("test-parallel-job", triggerSource = "TEST")
+        val run = coordinator.triggerJob("test-atomic-job", triggerSource = "TEST")
         assertNotNull(run)
 
         // Poll until completion or timeout (max 10 seconds)
@@ -76,8 +72,8 @@ class EndToEndSchedulerTest {
         assertTrue(completed, "JobRun should have reached COMPLETED status")
 
         val taskInstances = storage.getTaskInstancesForRun(run.runId)
-        assertEquals(3, taskInstances.size)
-        assertTrue(taskInstances.all { it.status == TaskStatus.COMPLETED }, "All task instances should be COMPLETED")
+        assertEquals(1, taskInstances.size)
+        assertEquals(JobStatus.COMPLETED, taskInstances[0].status)
 
         worker.stop()
         coordinator.stop()
@@ -191,9 +187,7 @@ class EndToEndSchedulerTest {
             jobId = "decoupled-job",
             name = "Decoupled Architecture Test",
             schedule = ScheduleSpec.Immediate,
-            tasks = listOf(
-                TaskSpec("step-1", "Echo Hello", action = TaskAction.Shell("echo hello"))
-            )
+            action = JobAction.Shell("echo hello")
         )
         apiMetadataStore.saveJob(job)
 
@@ -253,9 +247,7 @@ class EndToEndSchedulerTest {
             jobId = "future-renewal-job",
             name = "Renewal in 30 minutes",
             schedule = ScheduleSpec.OneOff(futureTime),
-            tasks = listOf(
-                TaskSpec("charge-step", "Charge Renewal", action = TaskAction.Shell("echo charged"))
-            )
+            action = JobAction.Shell("echo charged")
         )
         storage.saveJob(oneOffJob)
 
@@ -278,9 +270,7 @@ class EndToEndSchedulerTest {
             jobId = "immediate-signup-job",
             name = "Immediate Signup Charge",
             schedule = ScheduleSpec.Immediate,
-            tasks = listOf(
-                TaskSpec("signup-charge", "Charge Signup", action = TaskAction.Shell("echo signup-ok"))
-            )
+            action = JobAction.Shell("echo signup-ok")
         )
         storage.saveJob(immediateJob)
 

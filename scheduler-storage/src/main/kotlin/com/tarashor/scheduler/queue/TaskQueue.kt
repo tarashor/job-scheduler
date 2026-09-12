@@ -148,3 +148,7 @@ class InMemoryTaskQueue(val numShards: Int = 16) : TaskQueue {
     }
     override suspend fun dlqSize(): Int = dlq.size
 }
+
+typealias JobQueue = TaskQueue
+typealias InMemoryJobQueue = InMemoryTaskQueue
+
