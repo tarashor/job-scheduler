@@ -48,11 +48,16 @@
 flowchart TD
     ClientSvc["Клієнтські мікросервіси<br/>(Order, Billing, Analytics)"] -->|"REST / HTTP"| API["1. scheduler-api Мікросервіс<br/>(Порт :8080)"]
     
-    subgraph StorageLayer ["Інфраструктура черг та координації"]
-        Redis[("Redis 7<br/>• Розподілена ZSET черга затримок<br/>• Лізингові блокування (SET NX PX)<br/>• Хеші метаданих та запусків")]
+    subgraph APIDatabase ["Доменна БД API (Database-per-Microservice)"]
+        MetaDB[("Metadata DB: SQLite / PostgreSQL<br/>• Специфікації завдань (JobSpec)<br/>• Топологія DAG графів<br/>• Cron-розклади")]
+    end
+    API <-->|"CRUD метаданих завдань"| MetaDB
+
+    subgraph StorageLayer ["Шар координації та черг: Redis"]
+        Redis[("Redis 7 (In-Memory)<br/>• Шардована черга затримок (ZSET)<br/>• Лізингові блокування (SET NX PX)<br/>• Реєстр воркерів & Heartbeats")]
     end
 
-    API -->|"Збереження Job / Миттєвий запуск"| Redis
+    API -->|"Trigger / Enqueue готових завдань"| Redis
 
     subgraph CoordinatorPods ["2. scheduler-coordinator Мікросервіси"]
         C1["Coordinator Под 1<br/>(Активний лідер)"]
@@ -61,11 +66,12 @@ flowchart TD
         C2 -.->|"Відстеження завершення лізу"| Redis
     end
 
+    C1 <-->|"Читання розкладів"| MetaDB
     C1 -- "Таймер розкладу завдань<br/>Оцінювач залежностей DAG<br/>Reaper завислих воркерів" --> Redis
 
-    subgraph WorkerPool ["3. scheduler-worker Мікросервісні поди"]
-        W1["Воркер-под Alpha<br/>(Місткість: 4 завдання)"]
-        W2["Воркер-под Beta<br/>(Місткість: 4 завдання)"]
+    subgraph WorkerPool ["3. scheduler-worker Мікросервісні поди (Stateless)"]
+        W1["Воркер-под Alpha<br/>(Stateless, місткість: 4)"]
+        W2["Воркер-под Beta<br/>(Stateless, місткість: 4)"]
     end
 
     Redis -- "Pull готових завдань (Backpressure)" --> W1
@@ -151,13 +157,13 @@ sequenceDiagram
 
 ### Ролі та обов'язки мікросервісів
 
-| Мікросервіс | Модуль коду | Стратегія масштабування | Основна відповідальність |
-| :--- | :--- | :--- | :--- |
-| **`scheduler-api`** | `scheduler-api` | Без збереження стану (Stateless, $N$ реплік за Ingress) | Вхідний REST API для зовнішніх систем, реєстрація завдань, запит статусу, керування DLQ, вбудований Web Dashboard. |
-| **`scheduler-coordinator`** | `scheduler-coordinator` | Активний-Резервний (Active-Standby, $2$–$3$ репліки) | Годинник розкладу, подовження лідерського лізу, просування залежностей DAG, виявлення та рекламація завислих воркерів. |
-| **`scheduler-worker`** | `scheduler-worker` | Горизонтальне авто-масштабування ($N$ воркер-подів) | Витягування завдань із черги, контроль ліміту місткості, виконання HTTP-вебхуків/скриптів, надсилання heartbeats. |
-| **`scheduler-storage`** | `scheduler-storage` | Спільна бібліотека | Високопродуктивний шар роботи з Redis та SQLite, розподілені лізи та черга затримок на базі пріоритетів. |
-| **`scheduler-common`** | `scheduler-common` | Спільна бібліотека | Доменні моделі даних, рушій DAG на базі алгоритму Кана та парсер 5-значних Cron-виразів. |
+| Мікросервіс | Модуль коду | Власна база даних | Стратегія масштабування | Основна відповідальність |
+| :--- | :--- | :--- | :--- | :--- |
+| **`scheduler-api`** | `scheduler-api` | **`JobMetadataStore`** (SQLite / PostgreSQL) | Stateless ($N$ реплік за Ingress) | Вхідний REST API, збереження специфікацій завдань, валідація графів DAG, запит статусу запусків, вбудований Web Dashboard. |
+| **`scheduler-coordinator`** | `scheduler-coordinator` | **`TaskQueue` + `LeaseStore`** (Redis Cluster) | Active-Standby ($2$–$3$ репліки) | Годинник розкладу, подовження лідерського лізу з Fencing Token, просування залежностей DAG, Reaper завислих воркерів. |
+| **`scheduler-worker`** | `scheduler-worker` | **Stateless (БЕЗ БД)** | Горизонтальне HPA ($N$ подів) | Повністю без збереження стану. Витягує завдання з черги, виконує HTTP-вебхуки/скрипти, надсилає heartbeats у `WorkerRegistry`. |
+| **`scheduler-storage`** | `scheduler-storage` | Доменні модулі сховищ | Спільна бібліотека | Ізольовані контракти `JobMetadataStore`, `RunHistoryStore`, `WorkerRegistry`, `CompositeSchedulerStorage`, підтримка SQLite та Redis. |
+| **`scheduler-common`** | `scheduler-common` | — | Спільна бібліотека | Доменні моделі даних, рушій DAG на базі алгоритму Кана та парсер 5-значних Cron-виразів. |
 
 ---
 
@@ -380,31 +386,37 @@ flowchart TD
 
 ```
 job-scheduler/
-├── docker-compose.yml                    # Оркестрація мультиконтейнерного кластера
+├── docker-compose.yml                    # Оркестрація мультиконтейнерного кластера з томами БД
 ├── docker/
-│   └── Dockerfile                        # Багатоетапна збірка контейнерних образів
+│   └── Dockerfile                        # Багатоетапна збірка контейнерних образів (Java 25)
 ├── scheduler-common/                     # [Спільна бібліотека]
 │   └── src/main/kotlin/com/tarashor/scheduler/core/
 │       ├── model/Models.kt               # Доменні моделі даних та DTO
 │       ├── cron/CronParser.kt            # Парсер 5-значних Cron-виразів
 │       └── dag/DAGEngine.kt              # Топологічне сортування за алгоритмом Кана
-├── scheduler-storage/                    # [Спільний шар даних]
+├── scheduler-storage/                    # [Шар даних: Database-per-Microservice]
+│   ├── src/main/kotlin/com/tarashor/scheduler/
+│   │   ├── storage/Storage.kt            # Інтерфейси JobMetadataStore, RunHistoryStore, WorkerRegistry та SQLite
+│   │   ├── storage/RedisStorage.kt       # Черга затримок Redis ZSET, лідерство та хеші
+│   │   └── storage/StorageFactory.kt     # Фабрика ізольованих сховищ для API, Coordinator та Worker
+│   └── src/test/kotlin/com/tarashor/scheduler/
+│       ├── DatabasePerMicroserviceTest.kt # Тести суворої ізоляції баз даних для кожного сервісу
+│       ├── LeaderElectionTest.kt         # Тести лізингу та Fencing Tokens
+│       └── TaskQueueAndDLQTest.kt        # Тести черги затримок та Dead Letter Queue
+├── scheduler-api/                        # [Мікросервіс 1: API Gateway & Dashboard]
 │   └── src/main/kotlin/com/tarashor/scheduler/
-│       ├── storage/Storage.kt            # Інтерфейси сховища та реалізація для SQLite
-│       ├── storage/RedisStorage.kt       # Черга затримок Redis ZSET та лізинговий механізм
-│       └── storage/StorageFactory.kt     # Автоконфігурація сховища зі змінних середовища
-├── scheduler-api/                        # [Мікросервіс 1]
-│   └── src/main/kotlin/com/tarashor/scheduler/
-│       ├── api/ApiApp.kt                 # Головна точка входу API-мікросервісу
+│       ├── api/ApiApp.kt                 # Головна точка входу API з власним JobMetadataStore
 │       ├── api/SchedulerApiServer.kt     # Маршрути Ktor REST API та налаштування CORS
 │       └── ui/DashboardHtml.kt           # Вбудована односторінкова веб-панель
-├── scheduler-coordinator/                # [Мікросервіс 2]
-│   └── src/main/kotlin/com/tarashor/scheduler/coordinator/
-│       ├── CoordinatorApp.kt             # Головна точка входу координатора
-│       └── SchedulerCoordinator.kt       # Вибори лідера, годинник розкладу та стан DAG
-└── scheduler-worker/                     # [Мікросервіс 3]
+├── scheduler-coordinator/                # [Мікросервіс 2: Distributed Coordinator]
+│   ├── src/main/kotlin/com/tarashor/scheduler/coordinator/
+│   │   ├── CoordinatorApp.kt             # Головна точка входу координатора
+│   │   └── SchedulerCoordinator.kt       # Вибори лідера, годинник розкладу та стан DAG
+│   └── src/test/kotlin/com/tarashor/scheduler/
+│       └── EndToEndSchedulerTest.kt      # Наскрізні тести DAG та decoupled Database-per-Microservice
+└── scheduler-worker/                     # [Мікросервіс 3: Stateless Worker Daemon]
     └── src/main/kotlin/com/tarashor/scheduler/worker/
-        ├── WorkerApp.kt                  # Головна точка входу воркера
+        ├── WorkerApp.kt                  # Головна точка входу воркера (БЕЗ доступу до метаданих БД)
         ├── WorkerNode.kt                 # Цикл опитування черги, керування місткістю та heartbeats
         └── TaskRunner.kt                 # Середовище виконання: HTTP-вебхуки, Shell-скрипти
 ```
@@ -421,12 +433,14 @@ docker-compose up --build
 ```
 
 Ця команда розгортає:
-- **`scheduler-redis`**: Розподілене сховище Redis та черга на порті `6379`.
-- **`scheduler-api-service`**: API-шлюз та Web UI на адресі `http://localhost:8080`.
+- **`scheduler-redis`**: Розподілений шар черги затримок (`ZSET`), лідерських блокувань (`SET NX PX`) та реєстру воркерів на порті `6379`.
+- **`scheduler-api-service`**: API-шлюз та Web UI на адресі `http://localhost:8080`, підключений до власної персистентної бази метаданих через том `metadata-storage` (`/app/data/api_metadata.db`).
 - **`scheduler-coordinator-primary`**: Основний активний координатор (лідер).
-- **`scheduler-coordinator-standby`**: Резервний координатор для демонстрації failover.
-- **`scheduler-worker-alpha`**: Перший воркер-под (місткість: 4 завдання).
-- **`scheduler-worker-beta`**: Другий воркер-под (місткість: 4 завдання).
+- **`scheduler-coordinator-standby`**: Резервний координатор для автоматичного перехоплення лідерства (Failover).
+- **`scheduler-worker-alpha`**: Перший воркер-под (місткість: 4 завдання). **Повністю Stateless** (БЕЗ томів БД).
+- **`scheduler-worker-beta`**: Другий воркер-под (місткість: 4 завдання). **Повністю Stateless** (БЕЗ томів БД).
+
+Воркери взаємодіють суто через чергу повідомлень та публікацію статусів, що забезпечує необмежене горизонтальне масштабування без навантаження на пули з'єднань з базою даних.
 
 ---
 
@@ -557,8 +571,8 @@ curl -X POST http://localhost:8080/api/cluster/stepdown
 | Субпроєкт | Що перевіряється тестами |
 | :--- | :--- |
 | **`scheduler-common`** | Парсинг Cron-виразів, кроки (`*/5`), діапазони (`1-5`), пресети (`@daily`), сортування за алгоритмом Кана, ромбовидні DAG-залежності, детекція циклів. |
-| **`scheduler-storage`** | Атомарне взяття лізу, взаємне виключення, продовження лізу, витягування з пріоритетної черги затримок, математика backoff-джитеру, ізоляція та повтор у DLQ. |
-| **`scheduler-coordinator`** | Наскрізне виконання багатокрокового DAG воркерами, виявлення збою воркера за таймаутом heartbeat та автоматична рекламація завдань процесом Reaper. |
+| **`scheduler-storage`** | **Ізоляція Database-per-Microservice** (`DatabasePerMicroserviceTest`): перевірка створення окремих схем БД без перетину таблиць (`jobs`, `job_runs`, `workers`), робота `CompositeSchedulerStorage`. Атомарне взяття лізу (`LeaderElectionTest`), пріоритетна черга затримок Redis `ZSET`, математика backoff-джитеру та ізоляція в DLQ (`TaskQueueAndDLQTest`). |
+| **`scheduler-coordinator`** | **Декомпонована оркестрація** (`EndToEndSchedulerTest`): наскрізний запуск DAG зі Stateless-воркером (без доступу до метаданих БД), автоматичний Reaper для аварійних воркерів та перехоплення лідерства. |
 
 ---
 
