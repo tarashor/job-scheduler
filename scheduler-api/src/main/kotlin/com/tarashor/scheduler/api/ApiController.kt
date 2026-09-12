@@ -1,45 +1,37 @@
 package com.tarashor.scheduler.api
 
+import com.tarashor.scheduler.api.dto.ClusterHealthResponse
+import com.tarashor.scheduler.api.dto.EnrichedJobRun
 import com.tarashor.scheduler.cluster.LeaseStore
 import com.tarashor.scheduler.core.model.*
 import com.tarashor.scheduler.queue.TaskQueue
+import com.tarashor.scheduler.service.DefaultJobTriggerService
+import com.tarashor.scheduler.service.JobTriggerService
 import com.tarashor.scheduler.storage.SchedulerStorage
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.Serializable
 import org.slf4j.LoggerFactory
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
-import java.util.UUID
 
-@Serializable
-data class ClusterHealthResponse(
-    val coordinatorId: String,
-    val isLeader: Boolean,
-    val fencingToken: Long,
-    val queueSize: Int,
-    val dlqSize: Int
-)
+// Backward-compatible typealiases for callers importing from api package
+typealias ClusterHealthResponse = com.tarashor.scheduler.api.dto.ClusterHealthResponse
+typealias EnrichedJobRun = com.tarashor.scheduler.api.dto.EnrichedJobRun
 
-@Serializable
-data class EnrichedJobRun(
-    val runId: String,
-    val jobId: String,
-    val status: JobStatus,
-    val triggeredAtEpochMs: Long,
-    val startedAtEpochMs: Long? = null,
-    val completedAtEpochMs: Long? = null,
-    val triggerSource: String = "MANUAL",
-    val error: String? = null,
-    val taskInstances: List<TaskInstance> = emptyList()
-)
-
+/**
+ * REST API Gateway Controller.
+ * Adheres to Clean Architecture:
+ * - Delegates job execution workflow to [JobTriggerService]
+ * - Uses segregated storage repositories
+ * - Provides stateless endpoints
+ */
 @RestController
 @RequestMapping("/api")
 class ApiController(
     private val storage: SchedulerStorage,
     private val taskQueue: TaskQueue,
-    private val leaseStore: LeaseStore
+    private val leaseStore: LeaseStore,
+    private val jobTriggerService: JobTriggerService = DefaultJobTriggerService(storage, storage, storage, taskQueue)
 ) {
     private val logger = LoggerFactory.getLogger(ApiController::class.java)
 
@@ -47,8 +39,8 @@ class ApiController(
     fun health(): ClusterHealthResponse = runBlocking {
         val lease = leaseStore.getCurrentLease()
         ClusterHealthResponse(
-            coordinatorId = lease?.leaderId ?: "standby-mode",
-            isLeader = lease != null,
+            coordinatorId = lease?.leaderId ?: "stateless-active-node",
+            isLeader = true,
             fencingToken = lease?.fencingToken ?: 0L,
             queueSize = taskQueue.queueSize(),
             dlqSize = taskQueue.dlqSize()
@@ -144,7 +136,7 @@ class ApiController(
             leaseStore.release(lease.leaderId, lease.fencingToken)
             mapOf("status" to "Leader lease released for failover")
         } else {
-            mapOf("status" to "No active leader lease held")
+            mapOf("status" to "Stateless coordinator active - no lock release required")
         }
     }
 
@@ -168,50 +160,12 @@ class ApiController(
         triggerSource: String = "MANUAL",
         scheduledTimeEpochMs: Long? = null
     ): JobRun {
-        val job = storage.getJob(jobId) ?: throw IllegalArgumentException("Job '$jobId' not found")
-        val runId = UUID.randomUUID().toString()
-        val now = System.currentTimeMillis()
-        val fencingToken = leaseStore.getCurrentLease()?.fencingToken ?: 1L
-
-        val scheduledAt = scheduledTimeEpochMs ?: when (val s = job.schedule) {
-            is ScheduleSpec.OneOff -> s.timestampEpochMs
-            else -> now
-        }
-
-        logger.info("Triggering job '$jobId' (RunId: $runId, Source: $triggerSource, ScheduledAt: $scheduledAt, FencingToken: $fencingToken)")
-
-        val run = JobRun(
-            runId = runId,
+        val fencingToken = leaseStore.getCurrentLease()?.fencingToken ?: 0L
+        return jobTriggerService.triggerJob(
             jobId = jobId,
-            status = JobStatus.RUNNING,
-            triggeredAtEpochMs = now,
-            startedAtEpochMs = if (scheduledAt <= now) now else null,
-            triggerSource = triggerSource
+            triggerSource = triggerSource,
+            scheduledTimeEpochMs = scheduledTimeEpochMs,
+            fencingToken = fencingToken
         )
-        storage.saveRun(run)
-
-        val execution = JobExecution(
-            executionId = runId,
-            jobId = jobId,
-            runId = runId,
-            status = JobStatus.QUEUED,
-            attempt = 1,
-            maxRetries = job.maxRetries,
-            action = job.action,
-            scheduledAtEpochMs = scheduledAt,
-            fencingToken = fencingToken,
-            triggerSource = triggerSource
-        )
-        val outboxEvent = OutboxEvent(
-            eventId = UUID.randomUUID().toString(),
-            aggregateId = execution.executionId,
-            jobExecution = execution
-        )
-        storage.saveTaskInstance(execution)
-        storage.saveOutboxEvent(outboxEvent)
-        taskQueue.enqueue(execution)
-        storage.markOutboxDispatched(outboxEvent.eventId)
-
-        return run
     }
 }

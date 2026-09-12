@@ -6,7 +6,12 @@ import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
-interface LeaseStore {
+interface DistributedLockStore {
+    fun tryAcquireLock(key: String, durationMs: Long): Boolean
+    fun releaseLock(key: String): Boolean
+}
+
+interface LeaseStore : DistributedLockStore {
     fun getCurrentLease(): LeaderLease?
     fun tryAcquire(nodeId: String, durationMs: Long): LeaderLease?
     fun tryRenew(nodeId: String, fencingToken: Long, durationMs: Long): LeaderLease?
@@ -16,6 +21,7 @@ interface LeaseStore {
 class InMemoryLeaseStore : LeaseStore {
     private val current = AtomicReference<LeaderLease?>(null)
     private var tokenSequence = 0L
+    private val locks = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     @Synchronized
     override fun getCurrentLease(): LeaderLease? {
@@ -64,6 +70,22 @@ class InMemoryLeaseStore : LeaseStore {
             return true
         }
         return false
+    }
+
+    @Synchronized
+    override fun tryAcquireLock(key: String, durationMs: Long): Boolean {
+        val now = System.currentTimeMillis()
+        val expiry = locks[key]
+        if (expiry == null || now > expiry) {
+            locks[key] = now + durationMs
+            return true
+        }
+        return false
+    }
+
+    @Synchronized
+    override fun releaseLock(key: String): Boolean {
+        return locks.remove(key) != null
     }
 }
 

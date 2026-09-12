@@ -13,7 +13,11 @@ data class StorageBundle(
     val taskQueue: TaskQueue,
     val jobMetadataStore: JobMetadataStore = storage,
     val runHistoryStore: RunHistoryStore = storage,
-    val workerRegistry: WorkerRegistry = storage
+    val workerRegistry: WorkerRegistry = storage,
+    val outboxStore: OutboxStore = storage,
+    val triggerService: com.tarashor.scheduler.service.JobTriggerService = com.tarashor.scheduler.service.DefaultJobTriggerService(
+        jobMetadataStore, runHistoryStore, storage, taskQueue
+    )
 )
 
 object StorageFactory {

@@ -2,20 +2,31 @@ package com.tarashor.scheduler.coordinator
 
 import com.tarashor.scheduler.cluster.LeaderElector
 import com.tarashor.scheduler.cluster.LeaseStore
-import com.tarashor.scheduler.core.cron.CronParser
-import com.tarashor.scheduler.core.model.*
+import com.tarashor.scheduler.coordinator.service.*
+import com.tarashor.scheduler.core.model.JobRun
+import com.tarashor.scheduler.core.model.TaskExecutionResult
+import com.tarashor.scheduler.core.model.TaskInstance
+import com.tarashor.scheduler.outbox.TransactionalOutboxDispatcher
 import com.tarashor.scheduler.queue.TaskQueue
-import com.tarashor.scheduler.storage.CompositeSchedulerStorage
-import com.tarashor.scheduler.storage.JobMetadataStore
-import com.tarashor.scheduler.storage.RunHistoryStore
-import com.tarashor.scheduler.storage.SchedulerStorage
-import com.tarashor.scheduler.storage.WorkerRegistry
+import com.tarashor.scheduler.service.DefaultJobTriggerService
+import com.tarashor.scheduler.service.JobTriggerService
+import com.tarashor.scheduler.storage.*
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
+/**
+ * Clean Architecture Scheduler Coordinator.
+ * Composes single-responsibility domain services:
+ * - [JobSchedulingService]: Stateless active-active schedule evaluation & dispatch.
+ * - [JobTriggerService]: Atomic job execution and outbox enqueueing.
+ * - [WorkerReconciliationService]: Dead worker detection and task reclamation.
+ * - [JobExecutionService]: Execution state transitions and DLQ routing.
+ *
+ * Microservices Architecture:
+ * When [statelessActiveActive] is true (default), coordinators run as 100% stateless peers
+ * without requiring single-leader election or failover downtime.
+ */
 class SchedulerCoordinator(
     val coordinatorId: String,
     val leaseStore: LeaseStore,
@@ -23,13 +34,16 @@ class SchedulerCoordinator(
     val runHistoryStore: RunHistoryStore,
     val workerRegistry: WorkerRegistry,
     val taskQueue: TaskQueue,
+    val outboxStore: OutboxStore = InMemoryOutboxStore(),
+    val triggerService: JobTriggerService = DefaultJobTriggerService(jobMetadataStore, runHistoryStore, outboxStore, taskQueue),
     private val tickIntervalMs: Long = 1_000,
     private val workerHeartbeatTimeoutMs: Long = 8_000,
-    private val leaseDurationMs: Long = 6_000
+    private val leaseDurationMs: Long = 6_000,
+    val statelessActiveActive: Boolean = true
 ) {
-    val storage: SchedulerStorage = CompositeSchedulerStorage(jobMetadataStore, runHistoryStore, workerRegistry)
+    val storage: SchedulerStorage = CompositeSchedulerStorage(jobMetadataStore, runHistoryStore, workerRegistry, outboxStore)
 
-    // Backward-compatible constructor for composite/monolithic storage
+    // Backward-compatible constructor for monolithic storage
     constructor(
         coordinatorId: String,
         leaseStore: LeaseStore,
@@ -37,7 +51,8 @@ class SchedulerCoordinator(
         taskQueue: TaskQueue,
         tickIntervalMs: Long = 1_000,
         workerHeartbeatTimeoutMs: Long = 8_000,
-        leaseDurationMs: Long = 6_000
+        leaseDurationMs: Long = 6_000,
+        statelessActiveActive: Boolean = true
     ) : this(
         coordinatorId = coordinatorId,
         leaseStore = leaseStore,
@@ -45,18 +60,23 @@ class SchedulerCoordinator(
         runHistoryStore = storage,
         workerRegistry = storage,
         taskQueue = taskQueue,
+        outboxStore = storage,
         tickIntervalMs = tickIntervalMs,
         workerHeartbeatTimeoutMs = workerHeartbeatTimeoutMs,
-        leaseDurationMs = leaseDurationMs
+        leaseDurationMs = leaseDurationMs,
+        statelessActiveActive = statelessActiveActive
     )
+
     private val logger = LoggerFactory.getLogger("Coordinator-$coordinatorId")
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val isRunning = AtomicBoolean(false)
 
-    // Cron tracking: jobId -> nextScheduledRunEpochMs
-    private val nextCronRuns = ConcurrentHashMap<String, Long>()
+    // Composed Domain Services (SOLID SRP)
+    val schedulingService: JobSchedulingService = DefaultJobSchedulingService(jobMetadataStore, triggerService, leaseStore)
+    val reconciliationService: WorkerReconciliationService = DefaultWorkerReconciliationService(workerRegistry, runHistoryStore, taskQueue)
+    val executionService: JobExecutionService = DefaultJobExecutionService(runHistoryStore, taskQueue)
 
-    val outboxDispatcher = com.tarashor.scheduler.outbox.TransactionalOutboxDispatcher(storage, taskQueue)
+    val outboxDispatcher = TransactionalOutboxDispatcher(storage, taskQueue)
 
     val leaderElector = LeaderElector(
         nodeId = coordinatorId,
@@ -64,30 +84,30 @@ class SchedulerCoordinator(
         leaseDurationMs = leaseDurationMs,
         heartbeatIntervalMs = 2_000,
         onElected = { lease ->
-            logger.info("Coordinator '$coordinatorId' became LEADER with fencing token ${lease.fencingToken}")
-            onBecameLeader(lease.fencingToken)
+            logger.info("Coordinator '$coordinatorId' elected LEADER (FencingToken=${lease.fencingToken})")
         },
         onRevoked = {
-            logger.warn("Coordinator '$coordinatorId' LOST leadership! Pausing scheduler loops.")
+            logger.warn("Coordinator '$coordinatorId' revoked from leadership")
         }
     )
 
-    fun isLeader(): Boolean = leaderElector.isLeader()
+    fun isLeader(): Boolean = if (statelessActiveActive) true else leaderElector.isLeader()
     fun getActiveFencingToken(): Long = leaderElector.getActiveLease()?.fencingToken ?: 0L
 
     fun start() {
         if (!isRunning.compareAndSet(false, true)) return
-        logger.info("Starting SchedulerCoordinator '$coordinatorId'")
+        logger.info("Starting SchedulerCoordinator '$coordinatorId' (statelessActiveActive=$statelessActiveActive)")
         leaderElector.start()
         outboxDispatcher.start(pollIntervalMs = 500L)
 
-        // 1. Scheduling clock loop (runs only when this node is leader)
+        // Scheduling loop: in stateless active-active mode, all peer pods execute cooperatively.
         scope.launch {
             while (isRunning.get()) {
                 if (isLeader()) {
                     try {
-                        tickSchedulingClock()
-                        reapDeadWorkers()
+                        val token = getActiveFencingToken()
+                        schedulingService.tick(token)
+                        reconciliationService.reapDeadWorkers(workerHeartbeatTimeoutMs)
                     } catch (e: CancellationException) {
                         break
                     } catch (e: Exception) {
@@ -99,182 +119,21 @@ class SchedulerCoordinator(
         }
     }
 
-    private fun onBecameLeader(fencingToken: Long) {
-        // Initialize next execution times for all cron/interval jobs
-        val jobs = storage.listJobs().filter { it.enabled }
-        val now = System.currentTimeMillis()
-        for (job in jobs) {
-            when (val sched = job.schedule) {
-                is ScheduleSpec.Cron -> {
-                    val parser = CronParser(sched.cronExpression)
-                    nextCronRuns[job.jobId] = parser.nextExecution(now)
-                }
-                is ScheduleSpec.Interval -> {
-                    nextCronRuns[job.jobId] = now + sched.intervalMs
-                }
-                else -> {}
-            }
-        }
-    }
-
-    private suspend fun tickSchedulingClock() {
-        val now = System.currentTimeMillis()
-        val jobs = storage.listJobs().filter { it.enabled }
-
-        for (job in jobs) {
-            when (val sched = job.schedule) {
-                is ScheduleSpec.Immediate -> {
-                    triggerJob(job.jobId, triggerSource = "IMMEDIATE")
-                    // Disable immediate job after triggering once
-                    storage.saveJob(job.copy(enabled = false))
-                }
-                is ScheduleSpec.OneOff -> {
-                    // Enqueue to sharded delayed queue immediately with target scheduled timestamp
-                    triggerJob(job.jobId, triggerSource = "ONE_OFF", scheduledTimeEpochMs = sched.timestampEpochMs)
-                    // Disable one-off job after enqueuing into delayed queue
-                    storage.saveJob(job.copy(enabled = false))
-                }
-                is ScheduleSpec.Cron -> {
-                    val nextRun = nextCronRuns.computeIfAbsent(job.jobId) {
-                        CronParser(sched.cronExpression).nextExecution(now)
-                    }
-                    if (now >= nextRun) {
-                        triggerJob(job.jobId, triggerSource = "CRON")
-                        val updatedNext = CronParser(sched.cronExpression).nextExecution(now)
-                        nextCronRuns[job.jobId] = updatedNext
-                    }
-                }
-                is ScheduleSpec.Interval -> {
-                    val nextRun = nextCronRuns.computeIfAbsent(job.jobId) { now + sched.intervalMs }
-                    if (now >= nextRun) {
-                        triggerJob(job.jobId, triggerSource = "INTERVAL")
-                        nextCronRuns[job.jobId] = now + sched.intervalMs
-                    }
-                }
-            }
-        }
-    }
-
     suspend fun triggerJob(
         jobId: String,
         triggerSource: String = "MANUAL",
         scheduledTimeEpochMs: Long? = null
     ): JobRun {
-        val job = storage.getJob(jobId) ?: throw IllegalArgumentException("Job '$jobId' not found")
-        val runId = UUID.randomUUID().toString()
-        val now = System.currentTimeMillis()
-        val fencingToken = getActiveFencingToken()
-
-        val scheduledAt = scheduledTimeEpochMs ?: when (val s = job.schedule) {
-            is ScheduleSpec.OneOff -> s.timestampEpochMs
-            else -> now
-        }
-
-        logger.info("Triggering job '$jobId' (RunId: $runId, Source: $triggerSource, ScheduledAt: $scheduledAt, FencingToken: $fencingToken)")
-
-        val run = JobRun(
-            runId = runId,
+        return triggerService.triggerJob(
             jobId = jobId,
-            status = JobStatus.RUNNING,
-            triggeredAtEpochMs = now,
-            startedAtEpochMs = if (scheduledAt <= now) now else null,
-            triggerSource = triggerSource
+            triggerSource = triggerSource,
+            scheduledTimeEpochMs = scheduledTimeEpochMs,
+            fencingToken = getActiveFencingToken()
         )
-        storage.saveRun(run)
-
-        // Transactional Outbox + Fast Path Enqueue for Atomic Job
-        val execution = JobExecution(
-            executionId = runId,
-            jobId = jobId,
-            runId = runId,
-            status = JobStatus.QUEUED,
-            attempt = 1,
-            maxRetries = job.maxRetries,
-            action = job.action,
-            scheduledAtEpochMs = scheduledAt,
-            fencingToken = fencingToken,
-            triggerSource = triggerSource
-        )
-        val outboxEvent = OutboxEvent(
-            eventId = UUID.randomUUID().toString(),
-            aggregateId = execution.executionId,
-            jobExecution = execution
-        )
-        storage.saveTaskInstance(execution)
-        storage.saveOutboxEvent(outboxEvent)
-        taskQueue.enqueue(execution)
-        storage.markOutboxDispatched(outboxEvent.eventId)
-
-        return run
     }
 
     suspend fun handleTaskCompletion(taskInstance: TaskInstance, result: TaskExecutionResult) {
-        val job = storage.getJob(taskInstance.jobId) ?: return
-        val run = storage.getRun(taskInstance.runId)
-
-        if (result.success) {
-            val completedInst = taskInstance.copy(
-                status = JobStatus.COMPLETED,
-                completedAtEpochMs = System.currentTimeMillis(),
-                output = result.output
-            )
-            storage.saveTaskInstance(completedInst)
-            if (run != null) {
-                storage.saveRun(
-                    run.copy(
-                        status = JobStatus.COMPLETED,
-                        completedAtEpochMs = System.currentTimeMillis()
-                    )
-                )
-            }
-            logger.info("Job '${taskInstance.jobId}' (Execution: '${taskInstance.executionId}') COMPLETED successfully")
-        } else {
-            // Execution failed
-            logger.warn("Job '${taskInstance.jobId}' (Execution: '${taskInstance.executionId}') failed: ${result.error}")
-            val nextAttempt = taskInstance.attempt + 1
-            if (nextAttempt <= taskInstance.maxRetries) {
-                // Retry with backoff
-                val retried = taskQueue.requeueWithBackoff(taskInstance, result.error ?: "Execution failed")
-                storage.saveTaskInstance(retried)
-            } else {
-                val failedInst = taskInstance.copy(
-                    status = JobStatus.DEAD_LETTER,
-                    completedAtEpochMs = System.currentTimeMillis(),
-                    error = result.error
-                )
-                storage.saveTaskInstance(failedInst)
-                if (run != null) {
-                    storage.saveRun(
-                        run.copy(
-                            status = JobStatus.FAILED,
-                            completedAtEpochMs = System.currentTimeMillis(),
-                            error = result.error
-                        )
-                    )
-                }
-            }
-        }
-    }
-
-    private suspend fun reapDeadWorkers() {
-        val now = System.currentTimeMillis()
-        val workers = storage.listWorkers()
-
-        for (worker in workers) {
-            if (worker.status == WorkerStatus.HEALTHY && (now - worker.lastHeartbeatEpochMs) > workerHeartbeatTimeoutMs) {
-                logger.error("Worker '${worker.workerId}' missed heartbeats for ${now - worker.lastHeartbeatEpochMs}ms! Marking DEAD.")
-                val deadWorker = worker.copy(status = WorkerStatus.DEAD, currentLoad = 0)
-                storage.upsertWorker(deadWorker)
-
-                // Reclaim all tasks assigned to this dead worker
-                val activeTasks = storage.findActiveTaskInstances().filter { it.assignedWorkerId == worker.workerId }
-                for (task in activeTasks) {
-                    logger.warn("Reclaiming task '${task.taskInstanceId}' from dead worker '${worker.workerId}'")
-                    val requeued = taskQueue.requeueWithBackoff(task, "Worker '${worker.workerId}' crashed / timed out")
-                    storage.saveTaskInstance(requeued)
-                }
-            }
-        }
+        executionService.handleExecutionCompletion(taskInstance, result)
     }
 
     suspend fun stop() {

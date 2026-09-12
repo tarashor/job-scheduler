@@ -87,6 +87,20 @@ class RedisStorage(private val pool: JedisPool) : SchedulerStorage, LeaseStore, 
         }
     }
 
+    override fun tryAcquireLock(key: String, durationMs: Long): Boolean {
+        return pool.resource.use { jedis ->
+            val params = redis.clients.jedis.params.SetParams().nx().px(durationMs)
+            val res = jedis.set("scheduler:lock:$key", "LOCKED", params)
+            res == "OK"
+        }
+    }
+
+    override fun releaseLock(key: String): Boolean {
+        return pool.resource.use { jedis ->
+            jedis.del("scheduler:lock:$key") > 0
+        }
+    }
+
     // --- TASK QUEUE ---
     override suspend fun enqueue(task: TaskInstance): Unit = withContext(Dispatchers.IO) {
         val queued = task.copy(status = TaskStatus.QUEUED)

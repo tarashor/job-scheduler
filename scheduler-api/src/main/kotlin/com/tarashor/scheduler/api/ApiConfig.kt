@@ -40,6 +40,9 @@ class ApiConfig : WebMvcConfigurer {
         workerRegistry: WorkerRegistry
     ): SchedulerStorage = CompositeSchedulerStorage(jobMetadataStore, runHistoryStore, workerRegistry)
 
+    @Bean
+    fun jobTriggerService(): com.tarashor.scheduler.service.JobTriggerService = storageBundle.triggerService
+
     override fun configureMessageConverters(converters: MutableList<HttpMessageConverter<*>>) {
         val json = Json {
             prettyPrint = true

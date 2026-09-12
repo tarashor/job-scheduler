@@ -5,174 +5,6 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.sql.DriverManager
-import java.util.concurrent.ConcurrentHashMap
-
-/**
- * Database-per-Microservice Domain Stores:
- * 1. JobMetadataStore: Owned by scheduler-api for permanent Job specifications.
- * 2. RunHistoryStore: Owned by history & audit service for run executions and task instances.
- * 3. WorkerRegistry: Used for worker health monitoring, heartbeats, and capacity tracking.
- */
-interface JobMetadataStore {
-    fun saveJob(job: JobSpec)
-    fun getJob(jobId: String): JobSpec?
-    fun listJobs(): List<JobSpec>
-    fun deleteJob(jobId: String): Boolean
-}
-
-interface RunHistoryStore {
-    fun saveRun(run: JobRun)
-    fun getRun(runId: String): JobRun?
-    fun listRuns(limit: Int = 100): List<JobRun>
-
-    fun saveTaskInstance(instance: TaskInstance)
-    fun getTaskInstance(taskInstanceId: String): TaskInstance?
-    fun getTaskInstancesForRun(runId: String): List<TaskInstance>
-    fun findActiveTaskInstances(): List<TaskInstance>
-}
-
-interface WorkerRegistry {
-    fun upsertWorker(worker: WorkerInfo)
-    fun getWorker(workerId: String): WorkerInfo?
-    fun listWorkers(): List<WorkerInfo>
-}
-
-interface OutboxStore {
-    fun saveOutboxEvent(event: OutboxEvent)
-    fun fetchPendingOutboxEvents(limit: Int = 100): List<OutboxEvent>
-    fun markOutboxDispatched(eventId: String, dispatchedAtEpochMs: Long = System.currentTimeMillis())
-}
-
-class InMemoryOutboxStore : OutboxStore {
-    private val events = ConcurrentHashMap<String, OutboxEvent>()
-
-    override fun saveOutboxEvent(event: OutboxEvent) {
-        events[event.eventId] = event
-    }
-
-    override fun fetchPendingOutboxEvents(limit: Int): List<OutboxEvent> {
-        return events.values
-            .filter { it.status == OutboxStatus.PENDING }
-            .sortedBy { it.createdAtEpochMs }
-            .take(limit)
-    }
-
-    override fun markOutboxDispatched(eventId: String, dispatchedAtEpochMs: Long) {
-        val current = events[eventId] ?: return
-        events[eventId] = current.copy(
-            status = OutboxStatus.DISPATCHED,
-            dispatchedAtEpochMs = dispatchedAtEpochMs
-        )
-    }
-}
-
-interface SchedulerStorage : JobMetadataStore, RunHistoryStore, WorkerRegistry, OutboxStore
-
-class CompositeSchedulerStorage(
-    val jobMetadataStore: JobMetadataStore,
-    val runHistoryStore: RunHistoryStore,
-    val workerRegistry: WorkerRegistry,
-    val outboxStore: OutboxStore = InMemoryOutboxStore()
-) : SchedulerStorage,
-    JobMetadataStore by jobMetadataStore,
-    RunHistoryStore by runHistoryStore,
-    WorkerRegistry by workerRegistry,
-    OutboxStore by outboxStore
-
-class InMemoryJobMetadataStore : JobMetadataStore {
-    private val jobs = ConcurrentHashMap<String, JobSpec>()
-    override fun saveJob(job: JobSpec) { jobs[job.jobId] = job }
-    override fun getJob(jobId: String): JobSpec? = jobs[jobId]
-    override fun listJobs(): List<JobSpec> = jobs.values.sortedByDescending { it.createdAtEpochMs }
-    override fun deleteJob(jobId: String): Boolean = jobs.remove(jobId) != null
-}
-
-class InMemoryRunHistoryStore : RunHistoryStore {
-    private val runs = ConcurrentHashMap<String, JobRun>()
-    private val taskInstances = ConcurrentHashMap<String, TaskInstance>()
-
-    override fun saveRun(run: JobRun) { runs[run.runId] = run }
-    override fun getRun(runId: String): JobRun? = runs[runId]
-    override fun listRuns(limit: Int): List<JobRun> = runs.values.sortedByDescending { it.triggeredAtEpochMs }.take(limit)
-
-    override fun saveTaskInstance(instance: TaskInstance) { taskInstances[instance.taskInstanceId] = instance }
-    override fun getTaskInstance(taskInstanceId: String): TaskInstance? = taskInstances[taskInstanceId]
-    override fun getTaskInstancesForRun(runId: String): List<TaskInstance> =
-        taskInstances.values.filter { it.runId == runId }.sortedBy { it.scheduledAtEpochMs }
-    override fun findActiveTaskInstances(): List<TaskInstance> =
-        taskInstances.values.filter { it.status in setOf(TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.RETRYING) }
-}
-
-class InMemoryWorkerRegistry : WorkerRegistry {
-    private val workers = ConcurrentHashMap<String, WorkerInfo>()
-    override fun upsertWorker(worker: WorkerInfo) { workers[worker.workerId] = worker }
-    override fun getWorker(workerId: String): WorkerInfo? = workers[workerId]
-    override fun listWorkers(): List<WorkerInfo> = workers.values.sortedBy { it.workerId }
-}
-
-class InMemorySchedulerStorage : SchedulerStorage {
-    private val jobs = ConcurrentHashMap<String, JobSpec>()
-    private val runs = ConcurrentHashMap<String, JobRun>()
-    private val taskInstances = ConcurrentHashMap<String, TaskInstance>()
-    private val workers = ConcurrentHashMap<String, WorkerInfo>()
-
-    override fun saveJob(job: JobSpec) {
-        jobs[job.jobId] = job
-    }
-
-    override fun getJob(jobId: String): JobSpec? = jobs[jobId]
-    override fun listJobs(): List<JobSpec> = jobs.values.sortedByDescending { it.createdAtEpochMs }
-    override fun deleteJob(jobId: String): Boolean = jobs.remove(jobId) != null
-
-    override fun saveRun(run: JobRun) {
-        runs[run.runId] = run
-    }
-
-    override fun getRun(runId: String): JobRun? = runs[runId]
-    override fun listRuns(limit: Int): List<JobRun> = runs.values
-        .sortedByDescending { it.triggeredAtEpochMs }
-        .take(limit)
-
-    override fun saveTaskInstance(instance: TaskInstance) {
-        taskInstances[instance.taskInstanceId] = instance
-    }
-
-    override fun getTaskInstance(taskInstanceId: String): TaskInstance? = taskInstances[taskInstanceId]
-
-    override fun getTaskInstancesForRun(runId: String): List<TaskInstance> =
-        taskInstances.values.filter { it.runId == runId }.sortedBy { it.scheduledAtEpochMs }
-
-    override fun findActiveTaskInstances(): List<TaskInstance> =
-        taskInstances.values.filter { it.status in setOf(TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.RETRYING) }
-
-    override fun upsertWorker(worker: WorkerInfo) {
-        workers[worker.workerId] = worker
-    }
-
-    override fun getWorker(workerId: String): WorkerInfo? = workers[workerId]
-    override fun listWorkers(): List<WorkerInfo> = workers.values.sortedBy { it.workerId }
-
-    private val outboxEvents = ConcurrentHashMap<String, OutboxEvent>()
-
-    override fun saveOutboxEvent(event: OutboxEvent) {
-        outboxEvents[event.eventId] = event
-    }
-
-    override fun fetchPendingOutboxEvents(limit: Int): List<OutboxEvent> {
-        return outboxEvents.values
-            .filter { it.status == OutboxStatus.PENDING }
-            .sortedBy { it.createdAtEpochMs }
-            .take(limit)
-    }
-
-    override fun markOutboxDispatched(eventId: String, dispatchedAtEpochMs: Long) {
-        val current = outboxEvents[eventId] ?: return
-        outboxEvents[eventId] = current.copy(
-            status = OutboxStatus.DISPATCHED,
-            dispatchedAtEpochMs = dispatchedAtEpochMs
-        )
-    }
-}
 
 class SqliteSchedulerStorage(private val dbPath: String = "scheduler.db") : SchedulerStorage {
     private val logger = LoggerFactory.getLogger(SqliteSchedulerStorage::class.java)
@@ -452,8 +284,12 @@ class SqliteSchedulerStorage(private val dbPath: String = "scheduler.db") : Sche
                 stmt.setString(2, event.aggregateId)
                 stmt.setString(3, event.status.name)
                 stmt.setLong(4, event.createdAtEpochMs)
-                val dispatched = event.dispatchedAtEpochMs
-                if (dispatched != null) stmt.setLong(5, dispatched) else stmt.setNull(5, java.sql.Types.INTEGER)
+                val dispatchedAt = event.dispatchedAtEpochMs
+                if (dispatchedAt != null) {
+                    stmt.setLong(5, dispatchedAt)
+                } else {
+                    stmt.setNull(5, java.sql.Types.BIGINT)
+                }
                 stmt.setString(6, payload)
                 stmt.executeUpdate()
             }
@@ -475,10 +311,19 @@ class SqliteSchedulerStorage(private val dbPath: String = "scheduler.db") : Sche
     }
 
     override fun markOutboxDispatched(eventId: String, dispatchedAtEpochMs: Long) {
+        val current = fetchPendingOutboxEvents(1000).find { it.eventId == eventId }
+        val updatedPayload = current?.copy(
+            status = OutboxStatus.DISPATCHED,
+            dispatchedAtEpochMs = dispatchedAtEpochMs
+        )?.let { json.encodeToString(it) }
+
         getConnection().use { conn ->
-            conn.prepareStatement("UPDATE outbox_events SET status = 'DISPATCHED', dispatched_at = ? WHERE event_id = ?").use { stmt ->
+            conn.prepareStatement(
+                "UPDATE outbox_events SET status = 'DISPATCHED', dispatched_at = ?, json_data = COALESCE(?, json_data) WHERE event_id = ?"
+            ).use { stmt ->
                 stmt.setLong(1, dispatchedAtEpochMs)
-                stmt.setString(2, eventId)
+                if (updatedPayload != null) stmt.setString(2, updatedPayload) else stmt.setNull(2, java.sql.Types.VARCHAR)
+                stmt.setString(3, eventId)
                 stmt.executeUpdate()
             }
         }

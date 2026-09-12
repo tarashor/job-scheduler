@@ -158,6 +158,19 @@ class WorkerNode(
                 )
             }
             runHistoryStore?.saveTaskInstance(completedTask)
+            val store = runHistoryStore
+            if (store != null) {
+                val currentRun = store.getRun(runningTask.runId)
+                if (currentRun != null) {
+                    store.saveRun(
+                        currentRun.copy(
+                            status = if (result.success) JobStatus.COMPLETED else JobStatus.FAILED,
+                            completedAtEpochMs = System.currentTimeMillis(),
+                            error = result.error
+                        )
+                    )
+                }
+            }
 
             if (onTaskCompleted != null) {
                 onTaskCompleted.invoke(completedTask, result)
