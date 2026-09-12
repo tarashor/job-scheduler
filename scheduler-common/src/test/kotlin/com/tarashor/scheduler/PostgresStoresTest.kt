@@ -148,4 +148,83 @@ class PostgresStoresTest {
         val pendingAfter = storage.fetchPendingOutboxEvents(10)
         assertTrue(pendingAfter.isEmpty())
     }
+
+    @Test
+    fun `test Cloud Tasks queues and tasks persistence`() {
+        val queue = QueueSpec(
+            queueId = "orders-q",
+            rateLimits = RateLimits(maxDispatchesPerSecond = 25.0, maxConcurrentDispatches = 4)
+        )
+        storage.saveQueue(queue)
+
+        val retrievedQueue = storage.getQueue("orders-q")
+        assertNotNull(retrievedQueue)
+        assertEquals(25.0, retrievedQueue.rateLimits.maxDispatchesPerSecond)
+
+        val task = TaskSpec(
+            taskId = "order-task-1",
+            queueId = "orders-q",
+            target = TaskTarget.HttpRequest(url = "https://example.com/webhook", httpMethod = "POST")
+        )
+        storage.saveTask(task)
+
+        val retrievedTask = storage.getTask("order-task-1")
+        assertNotNull(retrievedTask)
+        assertEquals("orders-q", retrievedTask.queueId)
+        assertEquals(TaskStatus.QUEUED, retrievedTask.status)
+
+        val taskList = storage.listTasks("orders-q")
+        assertEquals(1, taskList.size)
+
+        val purged = storage.purgeQueue("orders-q")
+        assertEquals(1, purged)
+        assertNull(storage.getTask("order-task-1"))
+    }
+
+    @Test
+    fun `test PostgresTaskQueue polling and requeueing with backoff`() = kotlinx.coroutines.runBlocking {
+        val pgQueue = PostgresTaskQueue(storage.dataSource)
+        val task = TaskInstance(
+            taskInstanceId = "pg-queue-item-1",
+            runId = "run-1",
+            jobId = "job-1",
+            taskId = "task-1",
+            scheduledAtEpochMs = System.currentTimeMillis() - 1000,
+            action = TaskAction.Shell("echo 1")
+        )
+
+        pgQueue.enqueue(task)
+        assertEquals(1, pgQueue.queueSize())
+
+        val polled = pgQueue.poll(lookaheadMs = 0, maxWaitMs = 500)
+        assertNotNull(polled)
+        assertEquals("pg-queue-item-1", polled.taskInstanceId)
+        assertEquals(TaskStatus.RUNNING, polled.status)
+
+        val requeued = pgQueue.requeueWithBackoff(polled, "Network timeout")
+        assertEquals(TaskStatus.RETRYING, requeued.status)
+        assertEquals(2, requeued.attempt)
+    }
+
+    @Test
+    fun `test PostgresLeaseStore leader election and renewal`() {
+        val leaseStore = PostgresLeaseStore(storage.dataSource)
+        val lease = leaseStore.tryAcquire("node-alpha", 5000)
+        assertNotNull(lease)
+        assertEquals("node-alpha", lease.leaderId)
+
+        val secondAttempt = leaseStore.tryAcquire("node-beta", 5000)
+        assertNull(secondAttempt, "Should not acquire lease when held by active node-alpha")
+
+        val current = leaseStore.getCurrentLease()
+        assertNotNull(current)
+        assertEquals("node-alpha", current.leaderId)
+
+        val renewed = leaseStore.tryRenew("node-alpha", lease.fencingToken, 5000)
+        assertNotNull(renewed)
+
+        assertTrue(leaseStore.release("node-alpha", lease.fencingToken))
+        assertNull(leaseStore.getCurrentLease())
+    }
 }
+

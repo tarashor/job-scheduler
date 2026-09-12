@@ -41,33 +41,23 @@ object StorageFactory {
      * while delegating task queue and leases to Redis/In-Memory.
      */
     fun createApiStorageFromEnv(): StorageBundle {
-        val baseBundle = createFromEnv()
         val pgUrl = getPostgresJdbcUrl()
-
         if (!pgUrl.isNullOrBlank()) {
             val pgUser = System.getenv("POSTGRES_USER") ?: "postgres"
             val pgPass = System.getenv("POSTGRES_PASSWORD") ?: "postgres"
             val maxPool = System.getenv("POSTGRES_MAX_POOL_SIZE")?.toIntOrNull() ?: 15
-            logger.info("Database-per-Microservice: Using scalable PostgreSQL JobMetadataStore at $pgUrl (poolSize=$maxPool)")
-
-            val ds = PostgresDataSourceFactory.createDataSource(pgUrl, pgUser, pgPass, maxPoolSize = maxPool, poolName = "ApiPostgresPool")
-            val jobStore = PostgresJobMetadataStore(ds)
-            val runStore = PostgresRunHistoryStore(ds)
-            val outboxStore = PostgresOutboxStore(ds)
-
-            val composite = CompositeSchedulerStorage(
-                jobMetadataStore = jobStore,
-                runHistoryStore = runStore,
-                workerRegistry = baseBundle.workerRegistry
-            )
+            logger.info("API: Using standalone PostgreSQL storage at $pgUrl (PostgresTaskQueue, PostgresLeaseStore)")
+            val pgStorage = PostgresSchedulerStorage(pgUrl, pgUser, pgPass, maxPool)
+            val pgQueue = PostgresTaskQueue(pgStorage.dataSource)
+            val pgLease = PostgresLeaseStore(pgStorage.dataSource)
             return StorageBundle(
-                storage = composite,
-                leaseStore = baseBundle.leaseStore,
-                taskQueue = baseBundle.taskQueue,
-                jobMetadataStore = jobStore,
-                runHistoryStore = runStore,
-                workerRegistry = baseBundle.workerRegistry,
-                outboxStore = outboxStore
+                storage = pgStorage,
+                leaseStore = pgLease,
+                taskQueue = pgQueue,
+                jobMetadataStore = pgStorage,
+                runHistoryStore = pgStorage,
+                workerRegistry = pgStorage,
+                outboxStore = pgStorage
             )
         }
 
@@ -75,8 +65,9 @@ object StorageFactory {
             ?: System.getenv("METADATA_DB_PATH")
 
         if (!metadataDbPath.isNullOrBlank()) {
-            logger.info("Database-per-Microservice: Using dedicated SQLite JobMetadataStore at $metadataDbPath")
+            logger.info("API: Using dedicated SQLite JobMetadataStore at $metadataDbPath")
             val jobStore = SqliteJobMetadataStore(metadataDbPath)
+            val baseBundle = createFromEnv()
             val composite = CompositeSchedulerStorage(
                 jobMetadataStore = jobStore,
                 runHistoryStore = baseBundle.runHistoryStore,
@@ -92,12 +83,11 @@ object StorageFactory {
             )
         }
 
-        return baseBundle
+        return createFromEnv()
     }
 
     /**
      * Creates storage tailored for the stateless scheduler-worker microservice.
-     * Workers do NOT need access to the job metadata store!
      */
     fun createWorkerStorageFromEnv(): StorageBundle {
         return createFromEnv()
@@ -107,33 +97,23 @@ object StorageFactory {
      * Creates storage tailored for the scheduler-coordinator microservice.
      */
     fun createCoordinatorStorageFromEnv(): StorageBundle {
-        val baseBundle = createFromEnv()
         val pgUrl = getPostgresJdbcUrl()
-
         if (!pgUrl.isNullOrBlank()) {
             val pgUser = System.getenv("POSTGRES_USER") ?: "postgres"
             val pgPass = System.getenv("POSTGRES_PASSWORD") ?: "postgres"
             val maxPool = System.getenv("POSTGRES_MAX_POOL_SIZE")?.toIntOrNull() ?: 10
-            logger.info("Coordinator: Attaching scalable PostgreSQL JobMetadataStore at $pgUrl")
-
-            val ds = PostgresDataSourceFactory.createDataSource(pgUrl, pgUser, pgPass, maxPoolSize = maxPool, poolName = "CoordinatorPostgresPool")
-            val jobStore = PostgresJobMetadataStore(ds)
-            val runStore = PostgresRunHistoryStore(ds)
-            val outboxStore = PostgresOutboxStore(ds)
-
-            val composite = CompositeSchedulerStorage(
-                jobMetadataStore = jobStore,
-                runHistoryStore = runStore,
-                workerRegistry = baseBundle.workerRegistry
-            )
+            logger.info("Coordinator: Using standalone PostgreSQL storage at $pgUrl (PostgresTaskQueue, PostgresLeaseStore)")
+            val pgStorage = PostgresSchedulerStorage(pgUrl, pgUser, pgPass, maxPool)
+            val pgQueue = PostgresTaskQueue(pgStorage.dataSource)
+            val pgLease = PostgresLeaseStore(pgStorage.dataSource)
             return StorageBundle(
-                storage = composite,
-                leaseStore = baseBundle.leaseStore,
-                taskQueue = baseBundle.taskQueue,
-                jobMetadataStore = jobStore,
-                runHistoryStore = runStore,
-                workerRegistry = baseBundle.workerRegistry,
-                outboxStore = outboxStore
+                storage = pgStorage,
+                leaseStore = pgLease,
+                taskQueue = pgQueue,
+                jobMetadataStore = pgStorage,
+                runHistoryStore = pgStorage,
+                workerRegistry = pgStorage,
+                outboxStore = pgStorage
             )
         }
 
@@ -143,6 +123,7 @@ object StorageFactory {
         if (!metadataDbPath.isNullOrBlank()) {
             logger.info("Coordinator: Attaching dedicated SQLite JobMetadataStore at $metadataDbPath")
             val jobStore = SqliteJobMetadataStore(metadataDbPath)
+            val baseBundle = createFromEnv()
             val composite = CompositeSchedulerStorage(
                 jobMetadataStore = jobStore,
                 runHistoryStore = baseBundle.runHistoryStore,
@@ -158,10 +139,32 @@ object StorageFactory {
             )
         }
 
-        return baseBundle
+        return createFromEnv()
     }
 
     fun createFromEnv(): StorageBundle {
+        // 1. Standalone PostgreSQL (Single Source of Truth without Redis)
+        val pgUrl = getPostgresJdbcUrl()
+        if (!pgUrl.isNullOrBlank()) {
+            val pgUser = System.getenv("POSTGRES_USER") ?: "postgres"
+            val pgPass = System.getenv("POSTGRES_PASSWORD") ?: "postgres"
+            val maxPool = System.getenv("POSTGRES_MAX_POOL_SIZE")?.toIntOrNull() ?: 15
+            logger.info("Initializing standalone PostgreSQL storage at $pgUrl (SKIP LOCKED TaskQueue, Zero Redis)")
+            val pgStorage = PostgresSchedulerStorage(pgUrl, pgUser, pgPass, maxPool)
+            val pgQueue = PostgresTaskQueue(pgStorage.dataSource)
+            val pgLease = PostgresLeaseStore(pgStorage.dataSource)
+            return StorageBundle(
+                storage = pgStorage,
+                leaseStore = pgLease,
+                taskQueue = pgQueue,
+                jobMetadataStore = pgStorage,
+                runHistoryStore = pgStorage,
+                workerRegistry = pgStorage,
+                outboxStore = pgStorage
+            )
+        }
+
+        // 2. Optional Redis Storage
         val redisHost = System.getenv("REDIS_HOST")
         if (!redisHost.isNullOrBlank()) {
             val redisPort = System.getenv("REDIS_PORT")?.toIntOrNull() ?: 6379
@@ -178,24 +181,7 @@ object StorageFactory {
             )
         }
 
-        val pgUrl = getPostgresJdbcUrl()
-        if (!pgUrl.isNullOrBlank()) {
-            val pgUser = System.getenv("POSTGRES_USER") ?: "postgres"
-            val pgPass = System.getenv("POSTGRES_PASSWORD") ?: "postgres"
-            val maxPool = System.getenv("POSTGRES_MAX_POOL_SIZE")?.toIntOrNull() ?: 15
-            logger.info("Initializing full PostgreSQL storage at $pgUrl")
-            val pgStorage = PostgresSchedulerStorage(pgUrl, pgUser, pgPass, maxPool)
-            return StorageBundle(
-                storage = pgStorage,
-                leaseStore = InMemoryLeaseStore(),
-                taskQueue = InMemoryTaskQueue(),
-                jobMetadataStore = pgStorage,
-                runHistoryStore = pgStorage,
-                workerRegistry = pgStorage,
-                outboxStore = pgStorage
-            )
-        }
-
+        // 3. SQLite Storage
         val sqliteDb = System.getenv("SQLITE_DB")
         if (!sqliteDb.isNullOrBlank()) {
             logger.info("Initializing SQLite storage at $sqliteDb")
@@ -210,6 +196,7 @@ object StorageFactory {
             )
         }
 
+        // 4. In-Memory Storage (Default / Hermetic Tests)
         logger.info("Initializing in-memory storage (default)")
         val inMemory = InMemorySchedulerStorage()
         return StorageBundle(
@@ -222,3 +209,4 @@ object StorageFactory {
         )
     }
 }
+

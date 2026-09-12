@@ -34,14 +34,23 @@ class ApiConfig : WebMvcConfigurer {
     fun leaseStore(): LeaseStore = storageBundle.leaseStore
 
     @Bean
-    fun schedulerStorage(
-        jobMetadataStore: JobMetadataStore,
-        runHistoryStore: RunHistoryStore,
-        workerRegistry: WorkerRegistry
-    ): SchedulerStorage = CompositeSchedulerStorage(jobMetadataStore, runHistoryStore, workerRegistry)
+    fun schedulerStorage(): SchedulerStorage = storageBundle.storage
+
+    @Bean
+    fun cloudTaskService(
+        schedulerStorage: SchedulerStorage,
+        taskQueue: TaskQueue
+    ): com.tarashor.scheduler.service.CloudTaskService = com.tarashor.scheduler.service.DefaultCloudTaskService(
+        queueStore = schedulerStorage,
+        taskStore = schedulerStorage,
+        runHistoryStore = schedulerStorage,
+        outboxStore = schedulerStorage,
+        taskQueue = taskQueue
+    )
 
     @Bean
     fun jobTriggerService(): com.tarashor.scheduler.service.JobTriggerService = storageBundle.triggerService
+
 
     override fun configureMessageConverters(converters: MutableList<HttpMessageConverter<*>>) {
         val json = Json {

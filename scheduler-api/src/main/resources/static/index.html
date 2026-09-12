@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Distributed Job Scheduler Dashboard</title>
+    <title>Cloud Tasks & Distributed Job Scheduler Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -25,64 +25,89 @@
         header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
         h1 { font-size: 24px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
         .badge-leader { background: rgba(63, 185, 80, 0.15); color: var(--accent-green); border: 1px solid var(--accent-green); padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 18px; }
-        .card h3 { font-size: 14px; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.5px; }
-        .card .stat { font-size: 28px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+        .card h3 { font-size: 13px; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.5px; }
+        .card .stat { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
         
+        .tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+        .tab-btn { background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--text-secondary); font-size: 14px; font-weight: 600; padding: 10px 18px; cursor: pointer; border-radius: 0; transition: all 0.2s; }
+        .tab-btn:hover { color: var(--text-primary); }
+        .tab-btn.active { color: var(--accent-blue); border-bottom-color: var(--accent-blue); }
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
         .section-header { display: flex; justify-content: space-between; align-items: center; margin: 24px 0 12px; }
-        .section-header h2 { font-size: 18px; font-weight: 600; }
+        .section-header h2 { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
         
-        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 14px; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border); }
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+        th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
         th { color: var(--text-secondary); font-weight: 600; background: rgba(255,255,255,0.02); }
         
         .status-badge { display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; font-family: 'JetBrains Mono', monospace; }
-        .status-COMPLETED, .status-HEALTHY { background: rgba(63, 185, 80, 0.15); color: var(--accent-green); }
-        .status-RUNNING { background: rgba(88, 166, 255, 0.15); color: var(--accent-blue); }
-        .status-QUEUED, .status-READY { background: rgba(210, 153, 34, 0.15); color: var(--accent-amber); }
-        .status-FAILED, .status-DEAD { background: rgba(248, 81, 73, 0.15); color: var(--accent-red); }
-        .status-DEAD_LETTER { background: rgba(188, 140, 255, 0.15); color: var(--accent-purple); }
+        .status-RUNNING, .status-HEALTHY, .status-COMPLETED { background: rgba(63, 185, 80, 0.15); color: var(--accent-green); }
+        .status-PAUSED, .status-SUSPECT, .status-RETRYING { background: rgba(210, 153, 34, 0.15); color: var(--accent-amber); }
+        .status-QUEUED, .status-SCHEDULED, .status-READY { background: rgba(88, 166, 255, 0.15); color: var(--accent-blue); }
+        .status-FAILED, .status-DEAD, .status-DISABLED { background: rgba(248, 81, 73, 0.15); color: var(--accent-red); }
+        .status-DEAD_LETTER, .status-DRAINING { background: rgba(188, 140, 255, 0.15); color: var(--accent-purple); }
 
         button { background: var(--accent-blue); color: #fff; border: none; padding: 7px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; transition: opacity 0.2s; }
         button:hover { opacity: 0.85; }
+        button.btn-success { background: var(--accent-green); }
         button.btn-danger { background: var(--accent-red); }
         button.btn-amber { background: var(--accent-amber); color: #000; }
+        button.btn-secondary { background: var(--bg-input); border: 1px solid var(--border); color: var(--text-primary); }
         button.btn-sm { padding: 4px 8px; font-size: 12px; }
 
         .task-node-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
         .task-node { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-size: 12px; }
         .task-node .name { font-weight: 600; font-family: 'JetBrains Mono', monospace; }
 
-        pre { font-family: 'JetBrains Mono', monospace; font-size: 12px; background: var(--bg-input); padding: 8px; border-radius: 4px; overflow-x: auto; color: #79c0ff; }
+        pre, code { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+        code { background: var(--bg-input); padding: 2px 6px; border-radius: 4px; color: #79c0ff; }
+
+        /* Modal Styles */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.65); backdrop-filter: blur(2px); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay.open { display: flex; }
+        .modal { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; width: 100%; max-width: 520px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+        .modal-header h3 { font-size: 18px; font-weight: 600; }
+        .form-group { margin-bottom: 14px; }
+        .form-group label { display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; font-weight: 600; text-transform: uppercase; }
+        .form-control { width: 100%; background: var(--bg-input); border: 1px solid var(--border); color: var(--text-primary); border-radius: 6px; padding: 8px 12px; font-size: 13px; outline: none; }
+        .form-control:focus { border-color: var(--accent-blue); }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
             <div>
-                <h1>⚙️ Distributed Job Scheduler</h1>
-                <p style="color: var(--text-secondary); font-size: 13px; margin-top: 4px;">Coordinator-Worker Cluster Architecture with Leased Leader Election & Distributed Task Execution</p>
+                <h1>☁️ Cloud Tasks & Distributed Scheduler</h1>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-top: 4px;">
+                    Google Cloud Tasks Architecture • PostgreSQL Standalone Engine (<code>FOR UPDATE SKIP LOCKED</code>) • Push HTTP & Shell Dispatching
+                </p>
             </div>
             <div style="display: flex; gap: 10px; align-items: center;">
                 <span id="leaderStatus" class="badge-leader">Leader: active-master</span>
                 <span id="fencingToken" class="badge-leader" style="border-color: var(--accent-purple); color: var(--accent-purple); background: rgba(188, 140, 255, 0.15)">Token: 1</span>
-                <button onclick="stepDownLeader()" class="btn-amber">Simulate Leader Failover</button>
+                <button onclick="refreshData()" class="btn-sm btn-secondary">↻ Refresh</button>
             </div>
         </header>
 
         <div class="grid">
             <div class="card">
-                <h3>Registered Jobs</h3>
-                <div class="stat" id="statJobs">-</div>
+                <h3>Cloud Queues</h3>
+                <div class="stat" style="color: var(--accent-blue);" id="statQueues">-</div>
             </div>
             <div class="card">
-                <h3>Active Workers</h3>
-                <div class="stat" style="color: var(--accent-green);" id="statWorkers">-</div>
-            </div>
-            <div class="card">
-                <h3>Queued Tasks</h3>
+                <h3>Queued / Delayed Tasks</h3>
                 <div class="stat" style="color: var(--accent-amber);" id="statQueue">-</div>
+            </div>
+            <div class="card">
+                <h3>Cluster Workers</h3>
+                <div class="stat" style="color: var(--accent-green);" id="statWorkers">-</div>
             </div>
             <div class="card">
                 <h3>Dead Letter Queue (DLQ)</h3>
@@ -90,88 +115,293 @@
             </div>
         </div>
 
-        <div class="section-header">
-            <h2>Cluster Workers</h2>
-            <button onclick="refreshData()" class="btn-sm">Refresh</button>
-        </div>
-        <div class="card" style="padding: 0; overflow-x: auto;">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Worker ID</th>
-                        <th>Status</th>
-                        <th>Capacity</th>
-                        <th>Current Load</th>
-                        <th>Active Tasks</th>
-                        <th>Last Heartbeat</th>
-                    </tr>
-                </thead>
-                <tbody id="workersBody"><tr><td colspan="6" style="text-align:center;">Loading workers...</td></tr></tbody>
-            </table>
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('cloud-tasks')">⚡ Google Cloud Tasks</button>
+            <button class="tab-btn" onclick="switchTab('jobs')">📅 Cron & Batch Jobs</button>
+            <button class="tab-btn" onclick="switchTab('cluster')">🖥️ Cluster & DLQ</button>
         </div>
 
-        <div class="section-header">
-            <h2>Job Definitions</h2>
-            <button onclick="triggerSampleJob()" class="btn-sm">+ Trigger Sample Job</button>
-        </div>
-        <div class="card" style="padding: 0; overflow-x: auto;">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Job ID</th>
-                        <th>Name</th>
-                        <th>Schedule</th>
-                        <th>Executable Action</th>
-                        <th>Operations</th>
-                    </tr>
-                </thead>
-                <tbody id="jobsBody"><tr><td colspan="5" style="text-align:center;">Loading jobs...</td></tr></tbody>
-            </table>
+        <!-- ============================================================== -->
+        <!-- TAB 1: GOOGLE CLOUD TASKS -->
+        <!-- ============================================================== -->
+        <div id="tab-cloud-tasks" class="tab-content active">
+            <div class="section-header">
+                <h2>Cloud Tasks Queues</h2>
+                <div style="display: flex; gap: 8px;">
+                    <button onclick="openCreateTaskModal()" class="btn-success">+ Enqueue Task</button>
+                    <button onclick="sendQuickTestTask()" class="btn-sm btn-secondary">⚡ Quick Test Task</button>
+                    <button onclick="openCreateQueueModal()" class="btn-sm">+ Create Queue</button>
+                </div>
+            </div>
+            <div class="card" style="padding: 0; overflow-x: auto; margin-bottom: 24px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Queue ID</th>
+                            <th>State</th>
+                            <th>Rate Limits</th>
+                            <th>Pending</th>
+                            <th>Running</th>
+                            <th>Completed</th>
+                            <th>Failed</th>
+                            <th>Operations</th>
+                        </tr>
+                    </thead>
+                    <tbody id="queuesBody"><tr><td colspan="8" style="text-align:center;">Loading queues...</td></tr></tbody>
+                </table>
+            </div>
+
+            <div class="section-header">
+                <h2>Cloud Tasks</h2>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <label style="font-size: 12px; color: var(--text-secondary);">Queue:</label>
+                    <select id="queueFilterSelect" onchange="filterTasks()" class="form-control" style="width: auto; padding: 4px 8px; font-size: 12px;">
+                        <option value="ALL">All Queues</option>
+                    </select>
+                </div>
+            </div>
+            <div class="card" style="padding: 0; overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Task ID</th>
+                            <th>Queue</th>
+                            <th>Target / Action</th>
+                            <th>Status</th>
+                            <th>Schedule Time</th>
+                            <th>Attempts</th>
+                            <th>Created At</th>
+                            <th>Operations</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tasksBody"><tr><td colspan="8" style="text-align:center;">Loading tasks...</td></tr></tbody>
+                </table>
+            </div>
         </div>
 
-        <div class="section-header">
-            <h2>Recent Job Runs</h2>
-        </div>
-        <div class="card" style="padding: 0; overflow-x: auto;">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Run ID</th>
-                        <th>Job ID</th>
-                        <th>Status</th>
-                        <th>Trigger Source</th>
-                        <th>Triggered At</th>
-                        <th>Task Instances</th>
-                    </tr>
-                </thead>
-                <tbody id="runsBody"><tr><td colspan="6" style="text-align:center;">Loading runs...</td></tr></tbody>
-            </table>
+        <!-- ============================================================== -->
+        <!-- TAB 2: CRON & BATCH JOBS -->
+        <!-- ============================================================== -->
+        <div id="tab-jobs" class="tab-content">
+            <div class="section-header">
+                <h2>Registered Job Specifications</h2>
+                <button onclick="triggerSampleJob()" class="btn-sm">+ Trigger Sample Job</button>
+            </div>
+            <div class="card" style="padding: 0; overflow-x: auto; margin-bottom: 24px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Job ID</th>
+                            <th>Name</th>
+                            <th>Schedule</th>
+                            <th>Executable Action</th>
+                            <th>Operations</th>
+                        </tr>
+                    </thead>
+                    <tbody id="jobsBody"><tr><td colspan="5" style="text-align:center;">Loading jobs...</td></tr></tbody>
+                </table>
+            </div>
+
+            <div class="section-header">
+                <h2>Recent Job Runs</h2>
+            </div>
+            <div class="card" style="padding: 0; overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Run ID</th>
+                            <th>Job ID</th>
+                            <th>Status</th>
+                            <th>Trigger Source</th>
+                            <th>Triggered At</th>
+                            <th>Task Instances</th>
+                        </tr>
+                    </thead>
+                    <tbody id="runsBody"><tr><td colspan="6" style="text-align:center;">Loading runs...</td></tr></tbody>
+                </table>
+            </div>
         </div>
 
-        <div class="section-header">
-            <h2>Dead Letter Queue (DLQ)</h2>
+        <!-- ============================================================== -->
+        <!-- TAB 3: CLUSTER & DLQ -->
+        <!-- ============================================================== -->
+        <div id="tab-cluster" class="tab-content">
+            <div class="section-header">
+                <h2>Cluster Workers & Node Topology</h2>
+                <button onclick="stepDownLeader()" class="btn-amber btn-sm">Simulate Leader Failover</button>
+            </div>
+            <div class="card" style="padding: 0; overflow-x: auto; margin-bottom: 24px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Worker ID</th>
+                            <th>Status</th>
+                            <th>Capacity</th>
+                            <th>Current Load</th>
+                            <th>Active Tasks</th>
+                            <th>Last Heartbeat</th>
+                        </tr>
+                    </thead>
+                    <tbody id="workersBody"><tr><td colspan="6" style="text-align:center;">Loading workers...</td></tr></tbody>
+                </table>
+            </div>
+
+            <div class="section-header">
+                <h2>Dead Letter Queue (DLQ)</h2>
+            </div>
+            <div class="card" style="padding: 0; overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>DLQ ID</th>
+                            <th>Task ID</th>
+                            <th>Attempts</th>
+                            <th>Failure Reason</th>
+                            <th>Failed At</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="dlqBody"><tr><td colspan="6" style="text-align:center;">DLQ is empty</td></tr></tbody>
+                </table>
+            </div>
         </div>
-        <div class="card" style="padding: 0; overflow-x: auto;">
-            <table>
-                <thead>
-                    <tr>
-                        <th>DLQ ID</th>
-                        <th>Task ID</th>
-                        <th>Attempts</th>
-                        <th>Failure Reason</th>
-                        <th>Failed At</th>
-                        <th>Action</th>
-                    </tr>
-                </thead>
-                <tbody id="dlqBody"><tr><td colspan="6" style="text-align:center;">DLQ is empty</td></tr></tbody>
-            </table>
+    </div>
+
+    <!-- ============================================================== -->
+    <!-- MODAL: CREATE QUEUE -->
+    <!-- ============================================================== -->
+    <div id="createQueueModal" class="modal-overlay">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Create Cloud Tasks Queue</h3>
+                <button onclick="closeModal('createQueueModal')" class="btn-sm btn-secondary">✕</button>
+            </div>
+            <form onsubmit="handleCreateQueue(event)">
+                <div class="form-group">
+                    <label>Queue ID / Name</label>
+                    <input type="text" id="newQueueId" class="form-control" required placeholder="e.g. email-queue or invoice-processor">
+                </div>
+                <div class="form-group">
+                    <label>Max Dispatches Per Second</label>
+                    <input type="number" id="newMaxDispatches" class="form-control" value="50.0" step="0.1" required>
+                </div>
+                <div class="form-group">
+                    <label>Max Concurrent Dispatches</label>
+                    <input type="number" id="newMaxConcurrent" class="form-control" value="10" required>
+                </div>
+                <div class="form-group">
+                    <label>Max Retry Attempts</label>
+                    <input type="number" id="newMaxAttempts" class="form-control" value="5" required>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" onclick="closeModal('createQueueModal')" class="btn-secondary">Cancel</button>
+                    <button type="submit">Create Queue</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ============================================================== -->
+    <!-- MODAL: ENQUEUE TASK -->
+    <!-- ============================================================== -->
+    <div id="createTaskModal" class="modal-overlay">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Enqueue Cloud Task</h3>
+                <button onclick="closeModal('createTaskModal')" class="btn-sm btn-secondary">✕</button>
+            </div>
+            <form onsubmit="handleCreateTask(event)">
+                <div class="form-group">
+                    <label>Target Queue</label>
+                    <select id="taskQueueId" class="form-control" required>
+                        <option value="default">default</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Task ID (Optional - Auto-generated if empty)</label>
+                    <input type="text" id="taskTaskId" class="form-control" placeholder="e.g. order-charge-98214">
+                </div>
+                <div class="form-group">
+                    <label>Target Type</label>
+                    <select id="taskTargetType" class="form-control" onchange="toggleTargetFields()">
+                        <option value="HTTP">HTTP Webhook (Push)</option>
+                        <option value="SHELL">Shell Command</option>
+                    </select>
+                </div>
+                <div id="httpTargetFields">
+                    <div class="form-group">
+                        <label>HTTP URL</label>
+                        <input type="text" id="taskHttpUrl" class="form-control" value="http://localhost:8080/api/mock/target" required>
+                    </div>
+                    <div class="form-group">
+                        <label>HTTP Method</label>
+                        <select id="taskHttpMethod" class="form-control">
+                            <option value="POST">POST</option>
+                            <option value="GET">GET</option>
+                            <option value="PUT">PUT</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>HTTP Body (JSON)</label>
+                        <textarea id="taskHttpBody" class="form-control" rows="3" placeholder='{"key": "value"}'>{"event": "task_dispatched", "source": "cloud-tasks"}</textarea>
+                    </div>
+                </div>
+                <div id="shellTargetFields" style="display: none;">
+                    <div class="form-group">
+                        <label>Shell Command</label>
+                        <input type="text" id="taskShellCommand" class="form-control" placeholder="echo 'Hello Cloud Tasks'">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Schedule Delay (Seconds, 0 = Immediate)</label>
+                    <input type="number" id="taskDelaySeconds" class="form-control" value="0" min="0">
+                </div>
+                <div class="modal-actions">
+                    <button type="button" onclick="closeModal('createTaskModal')" class="btn-secondary">Cancel</button>
+                    <button type="submit" class="btn-success">Enqueue Task</button>
+                </div>
+            </form>
         </div>
     </div>
 
     <script>
+        let cachedQueues = [];
+
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById('tab-' + tabId).classList.add('active');
+        }
+
+        function openModal(id) {
+            document.getElementById(id).classList.add('open');
+        }
+
+        function closeModal(id) {
+            document.getElementById(id).classList.remove('open');
+        }
+
+        function openCreateQueueModal() {
+            openModal('createQueueModal');
+        }
+
+        function openCreateTaskModal() {
+            const select = document.getElementById('taskQueueId');
+            select.innerHTML = cachedQueues.map(q => `<option value="${q.queueId}">${q.queueId}</option>`).join('') || '<option value="default">default</option>';
+            openModal('createTaskModal');
+        }
+
+        function toggleTargetFields() {
+            const type = document.getElementById('taskTargetType').value;
+            document.getElementById('httpTargetFields').style.display = type === 'HTTP' ? 'block' : 'none';
+            document.getElementById('shellTargetFields').style.display = type === 'SHELL' ? 'block' : 'none';
+        }
+
         async function fetchJson(url, options = {}) {
             try {
                 const res = await fetch(url, options);
+                if (!res.ok && res.status !== 204) return null;
                 return await res.json();
             } catch (err) {
                 console.error("Fetch failed", url, err);
@@ -188,12 +418,17 @@
                 document.getElementById('statDlq').textContent = health.dlqSize;
             }
 
-            const jobs = await fetchJson('/api/jobs');
-            if (jobs) {
-                document.getElementById('statJobs').textContent = jobs.length;
-                renderJobs(jobs);
+            // Cloud Queues
+            const queues = await fetchJson('/api/queues');
+            if (queues) {
+                cachedQueues = queues;
+                document.getElementById('statQueues').textContent = queues.length;
+                renderQueues(queues);
+                updateQueueFilterSelect(queues);
+                await loadTasksForActiveFilter();
             }
 
+            // Workers
             const workers = await fetchJson('/api/workers');
             if (workers) {
                 const healthyCount = workers.filter(w => w.status === 'HEALTHY').length;
@@ -201,15 +436,135 @@
                 renderWorkers(workers);
             }
 
+            // Jobs
+            const jobs = await fetchJson('/api/jobs');
+            if (jobs) {
+                renderJobs(jobs);
+            }
+
+            // Runs
             const runs = await fetchJson('/api/runs');
             if (runs) {
                 renderRuns(runs);
             }
 
+            // DLQ
             const dlq = await fetchJson('/api/dlq');
             if (dlq) {
                 renderDlq(dlq);
             }
+        }
+
+        function updateQueueFilterSelect(queues) {
+            const filterSelect = document.getElementById('queueFilterSelect');
+            const currentVal = filterSelect.value;
+            let html = '<option value="ALL">All Queues</option>';
+            queues.forEach(q => {
+                html += `<option value="${q.queueId}">${q.queueId}</option>`;
+            });
+            filterSelect.innerHTML = html;
+            if (queues.some(q => q.queueId === currentVal)) {
+                filterSelect.value = currentVal;
+            }
+        }
+
+        function renderQueues(queues) {
+            const tbody = document.getElementById('queuesBody');
+            if (queues.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--text-secondary);">No queues found</td></tr>';
+                return;
+            }
+            tbody.innerHTML = queues.map(q => {
+                const isPaused = q.state === 'PAUSED';
+                return `
+                    <tr>
+                        <td><strong><code>${q.queueId}</code></strong></td>
+                        <td><span class="status-badge status-${q.state}">${q.state}</span></td>
+                        <td>
+                            <code>${q.rateLimits.maxDispatchesPerSecond}/s</code> 
+                            <span style="color:var(--text-secondary);">(max conc: ${q.rateLimits.maxConcurrentDispatches})</span>
+                        </td>
+                        <td style="color: var(--accent-blue); font-weight: 600;">${q.pendingTaskCount}</td>
+                        <td style="color: var(--accent-amber); font-weight: 600;">${q.runningTaskCount}</td>
+                        <td style="color: var(--accent-green); font-weight: 600;">${q.completedTaskCount}</td>
+                        <td style="color: var(--accent-red); font-weight: 600;">${q.failedTaskCount}</td>
+                        <td style="display: flex; gap: 6px;">
+                            ${isPaused 
+                                ? `<button onclick="resumeQueue('${q.queueId}')" class="btn-sm btn-success">Resume</button>` 
+                                : `<button onclick="pauseQueue('${q.queueId}')" class="btn-sm btn-amber">Pause</button>`
+                            }
+                            <button onclick="purgeQueue('${q.queueId}')" class="btn-sm btn-secondary">Purge</button>
+                            ${q.queueId !== 'default' ? `<button onclick="deleteQueue('${q.queueId}')" class="btn-sm btn-danger">Delete</button>` : ''}
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        async function loadTasksForActiveFilter() {
+            const filterVal = document.getElementById('queueFilterSelect').value;
+            let allTasks = [];
+            if (filterVal === 'ALL') {
+                for (const q of cachedQueues) {
+                    const tasks = await fetchJson(`/api/queues/${q.queueId}/tasks`);
+                    if (tasks) allTasks.push(...tasks);
+                }
+            } else {
+                const tasks = await fetchJson(`/api/queues/${filterVal}/tasks`);
+                if (tasks) allTasks = tasks;
+            }
+            renderTasks(allTasks);
+        }
+
+        function filterTasks() {
+            loadTasksForActiveFilter();
+        }
+
+        function renderTasks(tasks) {
+            const tbody = document.getElementById('tasksBody');
+            if (tasks.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--text-secondary);">No tasks in selected queue(s)</td></tr>';
+                return;
+            }
+            tbody.innerHTML = tasks.map(t => {
+                let targetDisplay = '-';
+                if (t.target) {
+                    if (t.target.type === 'HttpRequest') {
+                        targetDisplay = `<code>${t.target.httpMethod || 'POST'} ${t.target.url}</code>`;
+                    } else if (t.target.type === 'Shell') {
+                        targetDisplay = `<code>$ ${t.target.command}</code>`;
+                    } else {
+                        targetDisplay = `<code>${JSON.stringify(t.target)}</code>`;
+                    }
+                }
+
+                const schedDiffMs = t.scheduleTimeEpochMs - Date.now();
+                let schedDisplay;
+                if (schedDiffMs <= 0) {
+                    schedDisplay = `<span style="color:var(--accent-green);">Immediate / Ready</span>`;
+                } else {
+                    const secs = Math.ceil(schedDiffMs / 1000);
+                    schedDisplay = `<span style="color:var(--accent-amber);">in ${secs}s</span> <small style="color:var(--text-secondary);">(${new Date(t.scheduleTimeEpochMs).toLocaleTimeString()})</small>`;
+                }
+
+                const isTerminal = t.status === 'COMPLETED' || t.status === 'FAILED' || t.status === 'CANCELLED';
+
+                return `
+                    <tr>
+                        <td><strong><code>${t.taskId.substring(0, 18)}...</code></strong></td>
+                        <td><code>${t.queueId}</code></td>
+                        <td>${targetDisplay}</td>
+                        <td><span class="status-badge status-${t.status}">${t.status}</span></td>
+                        <td>${schedDisplay}</td>
+                        <td>${t.attempt} / ${t.maxAttempts}</td>
+                        <td>${new Date(t.createdAtEpochMs).toLocaleTimeString()}</td>
+                        <td style="display: flex; gap: 6px;">
+                            ${!isTerminal ? `<button onclick="forceRunTask('${t.queueId}', '${t.taskId}')" class="btn-sm">Run Now</button>` : ''}
+                            <button onclick="deleteTask('${t.queueId}', '${t.taskId}')" class="btn-sm btn-danger">Cancel</button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
         }
 
         function renderWorkers(workers) {
@@ -302,6 +657,140 @@
                     <td><button onclick="retryDlq('${e.id}')" class="btn-sm btn-amber">Retry</button></td>
                 </tr>
             `).join('');
+        }
+
+        // ==========================================
+        // Queue Actions
+        // ==========================================
+        async function handleCreateQueue(e) {
+            e.preventDefault();
+            const queueId = document.getElementById('newQueueId').value.trim();
+            const rate = parseFloat(document.getElementById('newMaxDispatches').value);
+            const conc = parseInt(document.getElementById('newMaxConcurrent').value, 10);
+            const maxAtt = parseInt(document.getElementById('newMaxAttempts').value, 10);
+
+            const body = {
+                queueId: queueId,
+                state: "RUNNING",
+                rateLimits: {
+                    maxDispatchesPerSecond: rate,
+                    maxConcurrentDispatches: conc,
+                    maxBurstSize: Math.max(10, conc * 2)
+                },
+                retryConfig: {
+                    maxAttempts: maxAtt,
+                    minBackoffMs: 1000,
+                    maxBackoffMs: 300000,
+                    maxDoublings: 4
+                }
+            };
+
+            await fetch('/api/queues', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+
+            closeModal('createQueueModal');
+            document.getElementById('newQueueId').value = '';
+            setTimeout(refreshData, 200);
+        }
+
+        async function pauseQueue(queueId) {
+            await fetch(`/api/queues/${queueId}/pause`, { method: 'POST' });
+            setTimeout(refreshData, 200);
+        }
+
+        async function resumeQueue(queueId) {
+            await fetch(`/api/queues/${queueId}/resume`, { method: 'POST' });
+            setTimeout(refreshData, 200);
+        }
+
+        async function purgeQueue(queueId) {
+            if (!confirm(`Purge all pending tasks from queue '${queueId}'?`)) return;
+            await fetch(`/api/queues/${queueId}/purge`, { method: 'POST' });
+            setTimeout(refreshData, 200);
+        }
+
+        async function deleteQueue(queueId) {
+            if (!confirm(`Delete queue '${queueId}' and all its tasks?`)) return;
+            await fetch(`/api/queues/${queueId}`, { method: 'DELETE' });
+            setTimeout(refreshData, 200);
+        }
+
+        // ==========================================
+        // Task Actions
+        // ==========================================
+        async function handleCreateTask(e) {
+            e.preventDefault();
+            const queueId = document.getElementById('taskQueueId').value;
+            const taskId = document.getElementById('taskTaskId').value.trim();
+            const targetType = document.getElementById('taskTargetType').value;
+            const delaySec = parseInt(document.getElementById('taskDelaySeconds').value, 10) || 0;
+
+            let target;
+            if (targetType === 'HTTP') {
+                target = {
+                    type: "HttpRequest",
+                    url: document.getElementById('taskHttpUrl').value.trim(),
+                    httpMethod: document.getElementById('taskHttpMethod').value,
+                    body: document.getElementById('taskHttpBody').value.trim(),
+                    headers: { "Content-Type": "application/json" }
+                };
+            } else {
+                target = {
+                    type: "Shell",
+                    command: document.getElementById('taskShellCommand').value.trim() || "echo 'Executing Cloud Task'"
+                };
+            }
+
+            const scheduleTime = Date.now() + (delaySec * 1000);
+            const task = {
+                taskId: taskId,
+                queueId: queueId,
+                scheduleTimeEpochMs: scheduleTime,
+                target: target
+            };
+
+            await fetch(`/api/queues/${queueId}/tasks`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(task)
+            });
+
+            closeModal('createTaskModal');
+            setTimeout(refreshData, 200);
+        }
+
+        async function sendQuickTestTask() {
+            const task = {
+                taskId: "quick-test-" + Date.now().toString().slice(-5),
+                queueId: "default",
+                scheduleTimeEpochMs: Date.now(),
+                target: {
+                    type: "HttpRequest",
+                    url: "http://localhost:8080/api/mock/target",
+                    httpMethod: "POST",
+                    body: JSON.stringify({ message: "Quick test Cloud Task dispatch", timestamp: Date.now() }),
+                    headers: { "Content-Type": "application/json" }
+                }
+            };
+            await fetch('/api/queues/default/tasks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(task)
+            });
+            setTimeout(refreshData, 200);
+        }
+
+        async function forceRunTask(queueId, taskId) {
+            await fetch(`/api/queues/${queueId}/tasks/${taskId}/run`, { method: 'POST' });
+            setTimeout(refreshData, 200);
+        }
+
+        async function deleteTask(queueId, taskId) {
+            await fetch(`/api/queues/${queueId}/tasks/${taskId}`, { method: 'DELETE' });
+            setTimeout(refreshData, 200);
         }
 
         async function triggerJob(jobId) {

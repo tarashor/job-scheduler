@@ -77,10 +77,35 @@ class SqliteSchedulerStorage(private val dbPath: String = "scheduler.db") : Sche
                     );
                     """.trimIndent()
                 )
+
+                stmt.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS queues (
+                        queue_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL,
+                        json_data TEXT NOT NULL,
+                        created_at INTEGER NOT NULL
+                    );
+                    """.trimIndent()
+                )
+
+                stmt.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cloud_tasks (
+                        task_id TEXT PRIMARY KEY,
+                        queue_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        schedule_time INTEGER NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        json_data TEXT NOT NULL
+                    );
+                    """.trimIndent()
+                )
             }
         }
         logger.info("Initialized SQLite storage at $dbPath")
     }
+
 
     override fun saveJob(job: JobSpec) {
         val payload = json.encodeToString(job)
@@ -328,7 +353,131 @@ class SqliteSchedulerStorage(private val dbPath: String = "scheduler.db") : Sche
             }
         }
     }
+
+    override fun saveQueue(queue: QueueSpec) {
+        val payload = json.encodeToString(queue)
+        getConnection().use { conn ->
+            conn.prepareStatement(
+                "INSERT INTO queues(queue_id, state, json_data, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(queue_id) DO UPDATE SET state=excluded.state, json_data=excluded.json_data"
+            ).use { stmt ->
+                stmt.setString(1, queue.queueId)
+                stmt.setString(2, queue.state.name)
+                stmt.setString(3, payload)
+                stmt.setLong(4, queue.createdAtEpochMs)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    override fun getQueue(queueId: String): QueueSpec? {
+        getConnection().use { conn ->
+            conn.prepareStatement("SELECT json_data FROM queues WHERE queue_id = ?").use { stmt ->
+                stmt.setString(1, queueId)
+                val rs = stmt.executeQuery()
+                if (rs.next()) return json.decodeFromString<QueueSpec>(rs.getString("json_data"))
+            }
+        }
+        return null
+    }
+
+    override fun listQueues(): List<QueueSpec> {
+        val list = mutableListOf<QueueSpec>()
+        getConnection().use { conn ->
+            conn.prepareStatement("SELECT json_data FROM queues ORDER BY queue_id ASC").use { stmt ->
+                val rs = stmt.executeQuery()
+                while (rs.next()) {
+                    list.add(json.decodeFromString<QueueSpec>(rs.getString("json_data")))
+                }
+            }
+        }
+        return list
+    }
+
+    override fun deleteQueue(queueId: String): Boolean {
+        getConnection().use { conn ->
+            conn.prepareStatement("DELETE FROM queues WHERE queue_id = ?").use { stmt ->
+                stmt.setString(1, queueId)
+                return stmt.executeUpdate() > 0
+            }
+        }
+    }
+
+    override fun updateQueueState(queueId: String, state: QueueState): Boolean {
+        val existing = getQueue(queueId) ?: return false
+        saveQueue(existing.copy(state = state))
+        return true
+    }
+
+    override fun saveTask(task: TaskSpec) {
+        val payload = json.encodeToString(task)
+        getConnection().use { conn ->
+            conn.prepareStatement(
+                "INSERT INTO cloud_tasks(task_id, queue_id, status, schedule_time, created_at, json_data) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET queue_id=excluded.queue_id, status=excluded.status, schedule_time=excluded.schedule_time, json_data=excluded.json_data"
+            ).use { stmt ->
+                stmt.setString(1, task.taskId)
+                stmt.setString(2, task.queueId)
+                stmt.setString(3, task.status.name)
+                stmt.setLong(4, task.scheduledAtEpochMs)
+                stmt.setLong(5, task.createdAtEpochMs)
+                stmt.setString(6, payload)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    override fun getTask(taskId: String): TaskSpec? {
+        getConnection().use { conn ->
+            conn.prepareStatement("SELECT json_data FROM cloud_tasks WHERE task_id = ?").use { stmt ->
+                stmt.setString(1, taskId)
+                val rs = stmt.executeQuery()
+                if (rs.next()) return json.decodeFromString<TaskSpec>(rs.getString("json_data"))
+            }
+        }
+        return null
+    }
+
+    override fun listTasks(queueId: String?, status: TaskStatus?, limit: Int): List<TaskSpec> {
+        val list = mutableListOf<TaskSpec>()
+        val conditions = mutableListOf<String>()
+        if (!queueId.isNullOrBlank()) conditions.add("queue_id = ?")
+        if (status != null) conditions.add("status = ?")
+        val whereClause = if (conditions.isNotEmpty()) "WHERE " + conditions.joinToString(" AND ") else ""
+        val sql = "SELECT json_data FROM cloud_tasks $whereClause ORDER BY created_at DESC LIMIT ?"
+
+        getConnection().use { conn ->
+            conn.prepareStatement(sql).use { stmt ->
+                var paramIdx = 1
+                if (!queueId.isNullOrBlank()) stmt.setString(paramIdx++, queueId)
+                if (status != null) stmt.setString(paramIdx++, status.name)
+                stmt.setInt(paramIdx, limit)
+                val rs = stmt.executeQuery()
+                while (rs.next()) {
+                    list.add(json.decodeFromString<TaskSpec>(rs.getString("json_data")))
+                }
+            }
+        }
+        return list
+    }
+
+    override fun deleteTask(taskId: String): Boolean {
+        getConnection().use { conn ->
+            conn.prepareStatement("DELETE FROM cloud_tasks WHERE task_id = ?").use { stmt ->
+                stmt.setString(1, taskId)
+                return stmt.executeUpdate() > 0
+            }
+        }
+    }
+
+    override fun purgeQueue(queueId: String): Int {
+        getConnection().use { conn ->
+            conn.prepareStatement("DELETE FROM cloud_tasks WHERE queue_id = ? AND status IN ('QUEUED', 'SCHEDULED')").use { stmt ->
+                stmt.setString(1, queueId)
+                return stmt.executeUpdate()
+            }
+        }
+    }
 }
+
 
 class SqliteJobMetadataStore(private val dbPath: String = "scheduler-metadata.db") : JobMetadataStore {
     private val logger = LoggerFactory.getLogger(SqliteJobMetadataStore::class.java)

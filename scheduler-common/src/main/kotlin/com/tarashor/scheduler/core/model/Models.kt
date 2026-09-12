@@ -270,3 +270,134 @@ data class OutboxEvent(
         dispatchedAtEpochMs = dispatchedAtEpochMs
     )
 }
+
+// =======================================================
+// Google Cloud Tasks Architecture Domain Entities
+// ==========================================================
+
+@Serializable
+enum class QueueState {
+    RUNNING,
+    PAUSED,
+    DISABLED
+}
+
+@Serializable
+data class RateLimits(
+    val maxDispatchesPerSecond: Double = 50.0,
+    val maxConcurrentDispatches: Int = 10,
+    val maxBurstSize: Int = 100
+)
+
+@Serializable
+data class RetryConfig(
+    val maxAttempts: Int = 5,
+    val minBackoffMs: Long = 1_000L,
+    val maxBackoffMs: Long = 300_000L,
+    val maxDoublings: Int = 4,
+    val maxRetryDurationMs: Long = 86_400_000L
+)
+
+@Serializable
+data class QueueSpec(
+    val queueId: String,
+    val state: QueueState = QueueState.RUNNING,
+    val rateLimits: RateLimits = RateLimits(),
+    val retryConfig: RetryConfig = RetryConfig(),
+    val createdAtEpochMs: Long = System.currentTimeMillis()
+)
+
+@Serializable
+data class QueueStats(
+    val queueId: String,
+    val state: QueueState,
+    val pendingTaskCount: Int = 0,
+    val runningTaskCount: Int = 0,
+    val completedTaskCount: Int = 0,
+    val failedTaskCount: Int = 0,
+    val rateLimits: RateLimits = RateLimits(),
+    val retryConfig: RetryConfig = RetryConfig()
+)
+
+@Serializable
+sealed interface TaskTarget {
+    @Serializable
+    @SerialName("HttpRequest")
+    data class HttpRequest(
+        val url: String,
+        val httpMethod: String = "POST",
+        val body: String? = null,
+        val headers: Map<String, String> = emptyMap()
+    ) : TaskTarget
+
+    @Serializable
+    @SerialName("Shell")
+    data class Shell(val command: String) : TaskTarget
+
+    @Serializable
+    @SerialName("Simulate")
+    data class Simulate(
+        val durationMs: Long = 500,
+        val shouldFail: Boolean = false,
+        val message: String = "Execution successful"
+    ) : TaskTarget
+}
+
+fun TaskTarget.toJobAction(): JobAction = when (this) {
+    is TaskTarget.HttpRequest -> JobAction.Http(url, httpMethod, body, headers)
+    is TaskTarget.Shell -> JobAction.Shell(command)
+    is TaskTarget.Simulate -> JobAction.Simulate(durationMs, shouldFail, message)
+}
+
+fun JobAction.toTaskTarget(): TaskTarget = when (this) {
+    is JobAction.Http -> TaskTarget.HttpRequest(url, method, body, headers)
+    is JobAction.Shell -> TaskTarget.Shell(command)
+    is JobAction.Simulate -> TaskTarget.Simulate(durationMs, shouldFail, message)
+}
+
+@Serializable
+data class TaskSpec(
+    val taskId: String,
+    val queueId: String = "default",
+    val scheduleTimeEpochMs: Long = System.currentTimeMillis(),
+    val target: TaskTarget = TaskTarget.HttpRequest(url = "http://localhost:8080/api/mock/target"),
+    val status: TaskStatus = TaskStatus.QUEUED,
+    val attempt: Int = 0,
+    val maxAttempts: Int = 5,
+    val createdAtEpochMs: Long = System.currentTimeMillis(),
+    val scheduledAtEpochMs: Long = scheduleTimeEpochMs,
+    val dispatchedAtEpochMs: Long? = null,
+    val completedAtEpochMs: Long? = null,
+    val assignedWorkerId: String? = null,
+    val responseCode: Int? = null,
+    val responseOutput: String? = null,
+    val lastError: String? = null
+) {
+    // Interoperability with JobExecution/TaskInstance
+    val taskInstanceId: String get() = taskId
+    val executionId: String get() = taskId
+    val jobId: String get() = queueId
+    val action: JobAction get() = target.toJobAction()
+
+    fun toJobExecution(fencingToken: Long = 0L): JobExecution = JobExecution(
+        executionId = taskId,
+        jobId = queueId,
+        runId = taskId,
+        status = status,
+        attempt = if (attempt == 0) 1 else attempt,
+        maxRetries = maxAttempts,
+        action = action,
+        scheduledAtEpochMs = scheduledAtEpochMs,
+        startedAtEpochMs = dispatchedAtEpochMs,
+        completedAtEpochMs = completedAtEpochMs,
+        assignedWorkerId = assignedWorkerId,
+        fencingToken = fencingToken,
+        output = responseOutput,
+        error = lastError,
+        triggerSource = "CLOUD_TASKS"
+    )
+}
+
+typealias CloudTask = TaskSpec
+typealias CloudTaskQueue = QueueSpec
+

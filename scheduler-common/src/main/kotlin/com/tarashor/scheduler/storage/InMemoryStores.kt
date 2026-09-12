@@ -57,12 +57,48 @@ class InMemoryWorkerRegistry : WorkerRegistry {
     override fun listWorkers(): List<WorkerInfo> = workers.values.sortedBy { it.workerId }
 }
 
+class InMemoryQueueStore : QueueStore {
+    private val queues = ConcurrentHashMap<String, QueueSpec>()
+    init {
+        queues["default"] = QueueSpec(queueId = "default")
+    }
+    override fun saveQueue(queue: QueueSpec) { queues[queue.queueId] = queue }
+    override fun getQueue(queueId: String): QueueSpec? = queues[queueId]
+    override fun listQueues(): List<QueueSpec> = queues.values.sortedBy { it.queueId }
+    override fun deleteQueue(queueId: String): Boolean = queues.remove(queueId) != null
+    override fun updateQueueState(queueId: String, state: QueueState): Boolean {
+        val q = queues[queueId] ?: return false
+        queues[queueId] = q.copy(state = state)
+        return true
+    }
+}
+
+class InMemoryTaskStore : TaskStore {
+    private val tasks = ConcurrentHashMap<String, TaskSpec>()
+    override fun saveTask(task: TaskSpec) { tasks[task.taskId] = task }
+    override fun getTask(taskId: String): TaskSpec? = tasks[taskId]
+    override fun listTasks(queueId: String?, status: TaskStatus?, limit: Int): List<TaskSpec> {
+        return tasks.values
+            .filter { (queueId == null || it.queueId == queueId) && (status == null || it.status == status) }
+            .sortedByDescending { it.createdAtEpochMs }
+            .take(limit)
+    }
+    override fun deleteTask(taskId: String): Boolean = tasks.remove(taskId) != null
+    override fun purgeQueue(queueId: String): Int {
+        val toRemove = tasks.values.filter { it.queueId == queueId && it.status in setOf(TaskStatus.QUEUED, TaskStatus.SCHEDULED) }
+        toRemove.forEach { tasks.remove(it.taskId) }
+        return toRemove.size
+    }
+}
+
 class InMemorySchedulerStorage : SchedulerStorage {
     private val jobs = ConcurrentHashMap<String, JobSpec>()
     private val runs = ConcurrentHashMap<String, JobRun>()
     private val taskInstances = ConcurrentHashMap<String, TaskInstance>()
     private val workers = ConcurrentHashMap<String, WorkerInfo>()
     private val outboxEvents = ConcurrentHashMap<String, OutboxEvent>()
+    private val queueStore = InMemoryQueueStore()
+    private val taskStore = InMemoryTaskStore()
 
     override fun saveJob(job: JobSpec) { jobs[job.jobId] = job }
     override fun getJob(jobId: String): JobSpec? = jobs[jobId]
@@ -100,4 +136,17 @@ class InMemorySchedulerStorage : SchedulerStorage {
             dispatchedAtEpochMs = dispatchedAtEpochMs
         )
     }
+
+    override fun saveQueue(queue: QueueSpec) = queueStore.saveQueue(queue)
+    override fun getQueue(queueId: String): QueueSpec? = queueStore.getQueue(queueId)
+    override fun listQueues(): List<QueueSpec> = queueStore.listQueues()
+    override fun deleteQueue(queueId: String): Boolean = queueStore.deleteQueue(queueId)
+    override fun updateQueueState(queueId: String, state: QueueState): Boolean = queueStore.updateQueueState(queueId, state)
+
+    override fun saveTask(task: TaskSpec) = taskStore.saveTask(task)
+    override fun getTask(taskId: String): TaskSpec? = taskStore.getTask(taskId)
+    override fun listTasks(queueId: String?, status: TaskStatus?, limit: Int): List<TaskSpec> = taskStore.listTasks(queueId, status, limit)
+    override fun deleteTask(taskId: String): Boolean = taskStore.deleteTask(taskId)
+    override fun purgeQueue(queueId: String): Int = taskStore.purgeQueue(queueId)
 }
+

@@ -8,9 +8,14 @@ class CompositeSchedulerStorage(
     val jobMetadataStore: JobMetadataStore,
     val runHistoryStore: RunHistoryStore,
     val workerRegistry: WorkerRegistry,
-    val outboxStore: OutboxStore = InMemoryOutboxStore()
+    val outboxStore: OutboxStore = InMemoryOutboxStore(),
+    val queueStore: QueueStore = InMemoryQueueStore(),
+    val taskStore: TaskStore = InMemoryTaskStore()
 ) : SchedulerStorage,
     JobMetadataStore by jobMetadataStore,
     RunHistoryStore by runHistoryStore,
     WorkerRegistry by workerRegistry,
-    OutboxStore by outboxStore
+    OutboxStore by outboxStore,
+    QueueStore by queueStore,
+    TaskStore by taskStore
+

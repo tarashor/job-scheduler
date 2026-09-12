@@ -329,4 +329,21 @@ class RedisStorage(private val pool: JedisPool) : SchedulerStorage, LeaseStore, 
             jedis.hset(keyOutbox, eventId, json.encodeToString(updated))
         }
     }
+
+    // --- QUEUE STORE & TASK STORE ---
+    private val queueStore = InMemoryQueueStore()
+    private val taskStore = InMemoryTaskStore()
+
+    override fun saveQueue(queue: QueueSpec) = queueStore.saveQueue(queue)
+    override fun getQueue(queueId: String): QueueSpec? = queueStore.getQueue(queueId)
+    override fun listQueues(): List<QueueSpec> = queueStore.listQueues()
+    override fun deleteQueue(queueId: String): Boolean = queueStore.deleteQueue(queueId)
+    override fun updateQueueState(queueId: String, state: QueueState): Boolean = queueStore.updateQueueState(queueId, state)
+
+    override fun saveTask(task: TaskSpec) = taskStore.saveTask(task)
+    override fun getTask(taskId: String): TaskSpec? = taskStore.getTask(taskId)
+    override fun listTasks(queueId: String?, status: TaskStatus?, limit: Int): List<TaskSpec> = taskStore.listTasks(queueId, status, limit)
+    override fun deleteTask(taskId: String): Boolean = taskStore.deleteTask(taskId)
+    override fun purgeQueue(queueId: String): Int = taskStore.purgeQueue(queueId)
 }
+
