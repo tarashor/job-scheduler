@@ -52,7 +52,7 @@ flowchart TD
     ClientSvc["Клієнтські мікросервіси<br/>(Order, Billing, Analytics)"] -->|"REST / HTTP"| API["1. scheduler-api Мікросервіс<br/>(Порт :8080)"]
     
     subgraph APIDatabase ["Доменна БД API (Database-per-Microservice)"]
-        MetaDB[("Metadata DB: SQLite / PostgreSQL<br/>• Специфікації завдань (JobSpec)<br/>• Специфікації дій (TaskAction)<br/>• Cron-розклади")]
+        MetaDB[("Metadata DB: SQLite / PostgreSQL<br/>• Специфікації завдань (JobSpec)<br/>• Виконувані дії (JobAction)<br/>• Cron-розклади")]
     end
     API <-->|"CRUD метаданих завдань"| MetaDB
 
@@ -328,7 +328,7 @@ flowchart TD
     Client -->|"HTTP POST /api/jobs"| API["1. scheduler-api"]
 
     subgraph APIDomain ["Домен метаданих (scheduler-api)"]
-        API -->|"CRUD конфігурацій"| APIDB[("Persistent Metadata DB<br/>PostgreSQL / CockroachDB<br/>• Специфікації завдань (JobSpec)<br/>• Специфікації дій (TaskAction)<br/>• Cron-розклади та політики")]
+        API -->|"CRUD конфігурацій"| APIDB[("Persistent Metadata DB<br/>PostgreSQL / CockroachDB<br/>• Специфікації завдань (JobSpec)<br/>• Виконувані дії (JobAction)<br/>• Cron-розклади та політики")]
         API -->|"Transactional Outbox"| OutboxTable["Таблиця outbox_events"]
     end
 
@@ -362,7 +362,7 @@ flowchart TD
 
 | Мікросервіс | Обране сховище даних | Модель та патерн доступу | Життєвий цикл даних |
 | :--- | :--- | :--- | :--- |
-| **`scheduler-api`** | **PostgreSQL** / **CockroachDB** | **ACID / Relational**: Збереження конфігурацій завдань (`JobSpec`), списків дій (`TaskAction`), Cron-розкладів, прав доступу (RBAC). Низький QPS, висока надійність. | Довгостроковий (роки), дискове збереження, регулярні бекапи. |
+| **`scheduler-api`** | **PostgreSQL** / **CockroachDB** | **ACID / Relational**: Збереження конфігурацій завдань (`JobSpec`), виконуваних дій (`JobAction`), Cron-розкладів, прав доступу (RBAC). Низький QPS, висока надійність. | Довгостроковий (роки), дискове збереження, регулярні бекапи. |
 | **`scheduler-coordinator`** | **Redis Cluster** (виділений) | **In-Memory Key-Value & SkipList**: Шардовані черги затримок (`ZSET`), лізингові блокування лідера (`SET NX PX`), heartbeat-хеші. Екстремальний QPS ($10\text{k} - 30\text{k}$ оп/сек), $O(\log N)$ затримки. | Тимчасовий (хвилини/години). Дані видаляються з черги відразу після забору воркером. |
 | **`scheduler-worker`** | **Stateless (БЕЗ власної БД)** | **No DB**: Воркери повністю позбавлені прямого доступу до баз даних. Отримують лише `TaskExecutionPayload` (URL, параметри, таймаут, `Idempotency-Key`) і публікують події статусу. | Відсутній (повна незалежність від сховищ). |
 | **`scheduler-history`** | **ClickHouse** / **ScyllaDB / S3** | **Append-Only Time-Series**: Журнал запусків `job_runs` та `task_executions`. Високошвидкісний паралельний запис ($10{,}000$ подій/сек), компресія у 5–10 разів, швидкі аналітичні агрегації по SLA. | Середньо- та довгостроковий (30 днів у гарячій БД $\approx 26\text{ ТБ}$, далі вивантаження в S3 Iceberg). |

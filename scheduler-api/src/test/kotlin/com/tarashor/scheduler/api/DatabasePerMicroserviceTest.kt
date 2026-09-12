@@ -27,7 +27,7 @@ class DatabasePerMicroserviceTest {
         val loaded = jobStore.getJob("job-invoice-generation")
         assertNotNull(loaded)
         assertEquals("Invoice Generation Job", loaded.name)
-        assertEquals(1, loaded.tasks.size)
+        assertEquals(job.action, loaded.action)
 
         // 2. List jobs
         val list = jobStore.listJobs()

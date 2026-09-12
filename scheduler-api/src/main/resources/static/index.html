@@ -121,8 +121,8 @@
                         <th>Job ID</th>
                         <th>Name</th>
                         <th>Schedule</th>
-                        <th>Tasks</th>
-                        <th>Action</th>
+                        <th>Executable Action</th>
+                        <th>Operations</th>
                     </tr>
                 </thead>
                 <tbody id="jobsBody"><tr><td colspan="5" style="text-align:center;">Loading jobs...</td></tr></tbody>
@@ -130,7 +130,7 @@
         </div>
 
         <div class="section-header">
-            <h2>Recent Job Runs & Task Progress</h2>
+            <h2>Recent Job Runs</h2>
         </div>
         <div class="card" style="padding: 0; overflow-x: auto;">
             <table>
@@ -241,13 +241,15 @@
             }
             tbody.innerHTML = jobs.map(j => {
                 const sched = typeof j.schedule === 'object' ? JSON.stringify(j.schedule) : j.schedule;
-                const taskList = j.tasks.map(t => `<span class="task-node"><span class="name">${t.taskId}</span>: ${t.name}</span>`).join(' ');
+                const actionStr = typeof j.action === 'object'
+                    ? (j.action.command ? `Shell: ${j.action.command}` : (j.action.url ? `HTTP: ${j.action.method || 'GET'} ${j.action.url}` : JSON.stringify(j.action)))
+                    : (j.action || 'Default Action');
                 return `
                     <tr>
                         <td><code>${j.jobId}</code></td>
                         <td><strong>${j.name}</strong></td>
                         <td><code>${sched}</code></td>
-                        <td><div class="task-node-list">${taskList}</div></td>
+                        <td><code>${actionStr}</code></td>
                         <td><button onclick="triggerJob('${j.jobId}')" class="btn-sm">Trigger Run</button></td>
                     </tr>
                 `;

@@ -57,16 +57,6 @@ sealed interface TaskAction {
 }
 
 @Serializable
-data class TaskSpec(
-    val taskId: String,
-    val name: String,
-    val action: JobAction,
-    val timeoutMs: Long = 30_000,
-    val maxRetries: Int = 3,
-    val backoffBaseMs: Long = 1_000
-)
-
-@Serializable
 data class JobSpec(
     val jobId: String,
     val name: String,
@@ -77,28 +67,7 @@ data class JobSpec(
     val backoffBaseMs: Long = 1_000,
     val enabled: Boolean = true,
     val createdAtEpochMs: Long = System.currentTimeMillis()
-) {
-    val tasks: List<TaskSpec> get() = listOf(TaskSpec(jobId, name, action, timeoutMs, maxRetries, backoffBaseMs))
-
-    constructor(
-        jobId: String,
-        name: String,
-        schedule: ScheduleSpec = ScheduleSpec.Immediate,
-        tasks: List<TaskSpec>,
-        enabled: Boolean = true,
-        createdAtEpochMs: Long = System.currentTimeMillis()
-    ) : this(
-        jobId = jobId,
-        name = name,
-        schedule = schedule,
-        action = tasks.firstOrNull()?.action ?: JobAction.Shell("echo 'Job executed'"),
-        timeoutMs = tasks.firstOrNull()?.timeoutMs ?: 30_000,
-        maxRetries = tasks.firstOrNull()?.maxRetries ?: 3,
-        backoffBaseMs = tasks.firstOrNull()?.backoffBaseMs ?: 1_000,
-        enabled = enabled,
-        createdAtEpochMs = createdAtEpochMs
-    )
-}
+)
 
 @Serializable
 enum class JobStatus {
