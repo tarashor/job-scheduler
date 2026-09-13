@@ -121,10 +121,17 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=scheduler
+      - POSTGRES_USER=scheduler
+      - POSTGRES_PASSWORD=scheduler_secret
       - WORKER_ID=worker-alpha
       - WORKER_CAPACITY=4
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   # -------------------------------------------------------------
@@ -139,10 +146,17 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=scheduler
+      - POSTGRES_USER=scheduler
+      - POSTGRES_PASSWORD=scheduler_secret
       - WORKER_ID=worker-beta
       - WORKER_CAPACITY=4
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
 volumes:

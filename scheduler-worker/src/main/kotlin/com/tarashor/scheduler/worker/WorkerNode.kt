@@ -2,6 +2,8 @@ package com.tarashor.scheduler.worker
 
 import com.tarashor.scheduler.core.model.*
 import com.tarashor.scheduler.queue.TaskQueue
+import com.tarashor.scheduler.service.DefaultExecutionCompletionService
+import com.tarashor.scheduler.service.ExecutionCompletionService
 import com.tarashor.scheduler.storage.RunHistoryStore
 import com.tarashor.scheduler.storage.SchedulerStorage
 import com.tarashor.scheduler.storage.WorkerRegistry
@@ -18,6 +20,7 @@ class WorkerNode(
     private val workerRegistry: WorkerRegistry,
     private val runHistoryStore: RunHistoryStore? = null,
     private val taskRunner: TaskRunner = DefaultTaskRunner(),
+    private val completionService: ExecutionCompletionService? = null,
     private val heartbeatIntervalMs: Long = 2_000,
     val prefetchLookaheadMs: Long = 5_000,
     val timingWheel: HashedTimingWheel = HashedTimingWheel(tickDurationMs = 20L),
@@ -50,6 +53,17 @@ class WorkerNode(
     private val isRunning = AtomicBoolean(false)
     private val currentLoad = AtomicInteger(0)
     private val activeTasks = ConcurrentHashMap<String, TaskInstance>()
+    private val effectiveCompletionService: ExecutionCompletionService? =
+        runHistoryStore?.let {
+            // A supplied callback is the legacy remote/coordinator completion
+            // path. Do not also apply the local transition or failures would be
+            // retried twice. In standalone workers, use the shared local service.
+            completionService ?: if (onTaskCompleted == null) {
+                DefaultExecutionCompletionService(it, taskQueue)
+            } else {
+                null
+            }
+        }
 
     fun start() {
         if (!isRunning.compareAndSet(false, true)) return
@@ -136,55 +150,28 @@ class WorkerNode(
         runHistoryStore?.saveTaskInstance(runningTask)
         logger.info("Worker '$workerId' executing task '${runningTask.taskInstanceId}' (Attempt ${runningTask.attempt})")
 
-        try {
+        val result = try {
             val timeoutMs = 30_000L // Default timeout, can be customized per task
-            val result = taskRunner.execute(runningTask, timeoutMs)
-
-            activeTasks.remove(runningTask.taskInstanceId)
-            currentLoad.decrementAndGet()
-
-            val completedTask = if (result.success) {
-                runningTask.copy(
-                    status = TaskStatus.COMPLETED,
-                    completedAtEpochMs = System.currentTimeMillis(),
-                    output = result.output,
-                    error = null
-                )
-            } else {
-                runningTask.copy(
-                    status = TaskStatus.FAILED,
-                    completedAtEpochMs = System.currentTimeMillis(),
-                    error = result.error
-                )
-            }
-            runHistoryStore?.saveTaskInstance(completedTask)
-            val store = runHistoryStore
-            if (store != null) {
-                val currentRun = store.getRun(runningTask.runId)
-                if (currentRun != null) {
-                    store.saveRun(
-                        currentRun.copy(
-                            status = if (result.success) JobStatus.COMPLETED else JobStatus.FAILED,
-                            completedAtEpochMs = System.currentTimeMillis(),
-                            error = result.error
-                        )
-                    )
-                }
-            }
-
-            if (onTaskCompleted != null) {
-                onTaskCompleted.invoke(completedTask, result)
-            }
+            taskRunner.execute(runningTask, timeoutMs)
         } catch (e: Exception) {
-            activeTasks.remove(runningTask.taskInstanceId)
-            currentLoad.decrementAndGet()
             logger.error("Unexpected exception processing task '${runningTask.taskInstanceId}'", e)
-            val failedTask = runningTask.copy(
-                status = TaskStatus.FAILED,
-                completedAtEpochMs = System.currentTimeMillis(),
-                error = e.message
+            TaskExecutionResult(
+                taskInstanceId = runningTask.taskInstanceId,
+                success = false,
+                error = e.message ?: e.javaClass.simpleName
             )
-            runHistoryStore?.saveTaskInstance(failedTask)
+        }
+
+        activeTasks.remove(runningTask.taskInstanceId)
+        currentLoad.decrementAndGet()
+
+        // State transitions and retry policy have one owner. In a standalone
+        // worker this is the shared local service; when a coordinator callback
+        // is supplied, that callback is the owner instead.
+        if (effectiveCompletionService != null) {
+            effectiveCompletionService.complete(runningTask, result)
+        } else {
+            onTaskCompleted?.invoke(runningTask, result)
         }
     }
 

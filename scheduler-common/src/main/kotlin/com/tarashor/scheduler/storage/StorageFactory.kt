@@ -101,10 +101,50 @@ object StorageFactory {
 
     /**
      * Creates storage tailored for the stateless scheduler-worker microservice.
-     * Workers do NOT need access to the job metadata store! Connects to Redis queue.
+     * Workers use Redis for the queue and worker registry, but share the durable
+     * PostgreSQL run-history store with the API and coordinator. Keeping the
+     * execution state in Redis here would make worker updates invisible to the
+     * coordinator when PostgreSQL is configured for the control plane.
      */
     fun createWorkerStorageFromEnv(): StorageBundle {
-        return createFromEnv()
+        val baseBundle = createFromEnv()
+        val pgUrl = getPostgresJdbcUrl()
+
+        if (!pgUrl.isNullOrBlank()) {
+            val pgUser = System.getenv("POSTGRES_USER") ?: "postgres"
+            val pgPass = System.getenv("POSTGRES_PASSWORD") ?: "postgres"
+            val maxPool = System.getenv("POSTGRES_MAX_POOL_SIZE")?.toIntOrNull() ?: 10
+            logger.info("Worker: sharing PostgreSQL RunHistoryStore at $pgUrl (poolSize=$maxPool)")
+
+            val dataSource = PostgresDataSourceFactory.createDataSource(
+                jdbcUrl = pgUrl,
+                user = pgUser,
+                password = pgPass,
+                maxPoolSize = maxPool,
+                poolName = "WorkerRunHistoryPool"
+            )
+            val runStore = PostgresRunHistoryStore(dataSource)
+            val composite = CompositeSchedulerStorage(
+                // These delegates are intentionally retained from the base bundle.
+                // Worker execution only needs RunHistoryStore, WorkerRegistry and
+                // TaskQueue; job metadata remains outside the worker boundary.
+                jobMetadataStore = baseBundle.jobMetadataStore,
+                runHistoryStore = runStore,
+                workerRegistry = baseBundle.workerRegistry,
+                outboxStore = baseBundle.outboxStore
+            )
+            return StorageBundle(
+                storage = composite,
+                leaseStore = baseBundle.leaseStore,
+                taskQueue = baseBundle.taskQueue,
+                jobMetadataStore = baseBundle.jobMetadataStore,
+                runHistoryStore = runStore,
+                workerRegistry = baseBundle.workerRegistry,
+                outboxStore = baseBundle.outboxStore
+            )
+        }
+
+        return baseBundle
     }
 
     /**
